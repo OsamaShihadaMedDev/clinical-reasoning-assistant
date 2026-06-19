@@ -220,7 +220,7 @@ A working web app where:
 
 ## 12. Build sequence (current state — update this section as steps complete)
 
-1. ☐ Finalize Pydantic data contracts between Triage Agent (incl. `reasoning` field) → Question Generator Agent(s) → Prioritization Agent → re-scoring loop.
+1. ☑ Finalize Pydantic data contracts between Triage Agent (incl. `reasoning` field) → Question Generator Agent(s) → Prioritization Agent → re-scoring loop. (`backend/app/models/`: `clinical.py`, `triage.py`, `trace.py`, re-exported from `__init__.py`.)
 2. ☑ FastAPI project folder structure scaffolded.
 3. ☐ Build the abstracted `call_agent()` function wrapping OpenRouter, with per-agent model routing as config.
 4. ☐ Hardcode the first clinical framework for ONE complaint (chest pain — canonical teaching example, well-known diagnostic arms) to validate the full pipeline end-to-end before generalizing.
@@ -228,4 +228,4 @@ A working web app where:
 6. ☐ Build minimal state tracking for re-scoring transitions, surfaced via a simple Trace Viewer panel (6b) as soon as the re-scoring loop works — not left until the end.
 7. ☐ Only after the single-complaint pipeline works end-to-end (re-scoring loop + Trace Viewer working) — generalize to additional complaints per the slow V2 roadmap (Section 10).
 
-**Next concrete task: item 1 — Pydantic contracts.**
+**Next concrete task: item 3 — the abstracted `call_agent()` function wrapping OpenRouter.**
