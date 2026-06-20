@@ -135,8 +135,9 @@ Must appear as a visible panel/expandable log in the UI — not buried in dev to
 ### Backend
 - **FastAPI** — async-native, pairs with concurrent agent calls, built-in Pydantic validation.
 - **Plain Python `asyncio`** for orchestration — NOT LangGraph/CrewAI for v1. Hand-rolling means Osama actually understands what's happening, and it's portfolio-honest ("I built the orchestration" vs. "I used a framework's orchestration"). Revisit a framework later only if complexity warrants it.
-- **Pydantic models define every agent handoff contract.** Define BEFORE writing any prompts. This is the single most important architectural decision in the project — it's what lets prompting/grounding strategy change later (RAG, different providers) without breaking the pipeline. Must include the `reasoning` field (6a) from the first schema pass.
-- **In-memory session state for MVP** (simple dict), upgrade path to Redis noted but not required. This state already tracks score transitions for re-scoring — the Trace Viewer (6b) reads from it, no separate storage needed.
+- **Pydantic models define every agent handoff contract.** Define BEFORE writing any prompts. This is the single most important architectural decision in the project — it's what lets prompting/grounding strategy change later (RAG, different providers) without breaking the pipeline. Must include the `reasoning` field (6a) from the first schema pass. The five locked inter-agent contracts live in `app/models/` (`ClinicalQuestion`, `DiagnosticArm`, `TriageOutput`, `RescoreTrigger`, `ScoreTransition`).
+- **One transport-only wrapper model exists OUTSIDE those five, on purpose:** `QuestionList` (defined in `question_generator.py`, not `app/models/`) wraps the Question Generator's single-call response (`list[ClinicalQuestion]`) because `call_agent()` constrains output to exactly one `BaseModel` and JSON-schema can't return a bare top-level array. It's a transport envelope for one API call, immediately unwrapped — NOT an inter-agent handoff contract, and must not be confused with the five locked contracts.
+- **In-memory session state for MVP** (simple dict), upgrade path to Redis noted but not required. This state already tracks score transitions for re-scoring — the Trace Viewer (6b) reads from it, no separate storage needed. Implemented as a module-level `dict[str, TriageOutput]` in `main.py`, keyed by a generated session id (Section 12 item 5).
 
 ### AI provider layer
 - **OpenRouter**, not a single hardcoded provider — lets agents route to different models by task complexity, A/B test quality per agent without touching pipeline code.
@@ -149,6 +150,7 @@ Must appear as a visible panel/expandable log in the UI — not buried in dev to
 | Question Generator Agent (per arm, ×N parallel) | Lower reasoning, templated | Cheap/fast — cost multiplies by arm count, keep cheap |
 | Prioritization / Red-Flag Agent | Highest stakes — safety-critical | Stronger (Sonnet-class or better) |
 
+- **The Prioritization / Red-Flag Agent combines re-scoring AND the red-flag safety check into ONE agent call**, not two separate steps — a deliberate scope decision made mid-build, because both judgments need the exact same input (the full current arm-state) and a re-score that ignored red-flag risk would be incomplete on its own. This is a conscious, justified deviation from the narrow-scope-per-agent rule (Section 6, point 1), documented at the top of `prioritization.py`. The red-flag net is honest reasoning text ("cannot be excluded despite low likelihood"), never an inflated score — score stays a pure likelihood.
 - No dedicated medical fine-tuned model — general frontier models currently outperform niche medical fine-tunes on structured clinical reasoning. Medical correctness comes from the **hardcoded clinical frameworks in the prompts** (Section 4), not model selection.
 - **Cost reality check:** a full interactive session (~20-25k tokens across initial fan-out + several re-scoring triggers) costs roughly $0.05 on a Haiku-class model. Not a constraint at MVP/demo scale. Prompt caching (~90% input cost reduction) is a good future optimization, not needed for v1.
 
@@ -200,6 +202,32 @@ A working web app where:
 
 ---
 
+## 9a. Known issues / open threads
+
+**Re-scoring quality with ambiguous patient input (observed, not yet fixed).**
+During manual UI testing, an answer of "feels like a slap on chest" — intended by the
+tester to suggest a cardiac-leaning sensation — was interpreted by the Prioritization
+Agent as atypical for ACS, and Cardiac's score dropped (0.85 -> 0.75) rather than rose.
+This is most likely an ambiguous-input issue rather than a re-scoring logic defect:
+"slap on chest" isn't a standard clinical descriptor, so the model's read (atypical,
+therefore lowering the classic-ACS likelihood) was a defensible interpretation of a
+genuinely vague phrase, not obviously wrong reasoning. Worth revisiting with clearer,
+more clinically standard test phrases before concluding anything is actually broken.
+Not blocking further build progress — noted for future testing/prompt refinement.
+
+**QUESTION_GENERATION_THRESHOLD reflects a reversed decision, not the original one.**
+Originally set to 0.4 as a deliberate cost-control gate (only meaningfully relevant
+arms get questions). During testing, lowered to 0.05 to force a fuller concurrent
+fan-out for demo/timing-proof purposes, and then KEPT at 0.05 as the actual ongoing
+decision — full fan-out (every active arm gets questions) is now the real product
+behavior, not just a demo setting. The config comment in config.py reflects this
+reversal. The future "manually promote a deprioritized arm" UI idea (Section 5/6)
+loses its original purpose if every active arm already gets questions regardless of
+score — if that UI idea resurfaces, it needs rethinking against this new reality,
+not implementing against the original assumption.
+
+---
+
 ## 10. V2 roadmap (only after MVP succeeds — do not pull forward)
 
 1. **RAG-based guideline support** — NICE, ESC, AHA, BTS as candidate sources. Plugs into the Triage Agent's `reasoning` field without a pipeline rewrite.
@@ -222,10 +250,29 @@ A working web app where:
 
 1. ☑ Finalize Pydantic data contracts between Triage Agent (incl. `reasoning` field) → Question Generator Agent(s) → Prioritization Agent → re-scoring loop. (`backend/app/models/`: `clinical.py`, `triage.py`, `trace.py`, re-exported from `__init__.py`.)
 2. ☑ FastAPI project folder structure scaffolded.
-3. ☐ Build the abstracted `call_agent()` function wrapping OpenRouter, with per-agent model routing as config.
-4. ☐ Hardcode the first clinical framework for ONE complaint (chest pain — canonical teaching example, well-known diagnostic arms) to validate the full pipeline end-to-end before generalizing.
-5. ☐ Get SSE streaming of arm cards working against this one hardcoded case before building out React UI polish.
-6. ☐ Build minimal state tracking for re-scoring transitions, surfaced via a simple Trace Viewer panel (6b) as soon as the re-scoring loop works — not left until the end.
+3. ☑ Build the abstracted `call_agent()` function wrapping OpenRouter, with per-agent model routing as config. (`backend/app/core/call_agent.py`; routing constants in `config.py`; schema-constrained structured outputs, fail-loud no-retry. Verified live against OpenRouter.)
+4. ☑ Hardcode the first clinical framework for ONE complaint (chest pain — canonical teaching example, well-known diagnostic arms) to validate the full pipeline end-to-end before generalizing. **Done — full single-complaint pipeline works end-to-end and is verified live via `_run_pipeline.py`:** chest pain framework (`backend/app/agents/frameworks/chest_pain.py`) → Triage Agent (`backend/app/agents/triage.py`) → Question Generator Agent (`backend/app/agents/question_generator.py`) + concurrent orchestration (`backend/app/core/orchestration.py`, genuine `asyncio.gather` fan-out) → Prioritization/re-score + red-flag Agent (`backend/app/agents/prioritization.py`) + feedback-loop orchestration (`backend/app/core/rescore.py`). The re-scoring loop produces real `ScoreTransition` records and the red-flag check surfaces as honest "cannot be excluded despite low likelihood" reasoning on dropped can't-miss arms (score stays an honest likelihood, never inflated).
+5. ◐ Wrap the working pipeline in a FastAPI layer and make it reachable/visible.
+   - ☑ First HTTP layer: `POST /api/triage` and `POST /api/answer` added to `main.py`,
+     plain request/response (no streaming yet). Verified live against the real
+     OpenRouter backend — health check, full triage+question-gen fan-out, a real
+     re-score via a typed answer, and a deliberately-bad session_id correctly
+     returning a clean 404 (and a bad question_id a clean 400), not an opaque 500.
+   - ☑ First visible UI: a throwaway plain HTML/JS demo page at
+     `backend/app/static/demo.html`, served same-origin (no CORS needed) via a
+     dedicated `GET /demo.html` `FileResponse` route — deliberately a route, NOT a
+     `StaticFiles` mount, to keep the exact top-level URL and avoid a catch-all
+     mount shadowing `/api/*`. Manually tested end-to-end: real chest pain scenario,
+     real typed answers, arm cards update with new scores/reasoning, and a manual
+     trace log on the page shows each `ScoreTransition` (old score -> new score,
+     triggering answer text), accumulating across multiple answered questions in one
+     session. Explicitly disposable — will be replaced by the real React frontend,
+     not iterated on further.
+   - ☐ Replace the current plain request/response wait (several seconds of nothing,
+     then everything appears at once) with SSE streaming, so arm cards appear
+     progressively as each agent finishes. This is the actual remaining work in this
+     item.
+6. ◐ Build minimal state tracking for re-scoring transitions, surfaced via a simple Trace Viewer panel (6b) as soon as the re-scoring loop works — not left until the end. **Data side done:** `process_answer()` already returns `list[ScoreTransition]` (computed in code, changed-arms-only), and the throwaway demo page (item 5) already renders an accumulating manual trace log from it. **Remaining:** the real Trace Viewer as a React component once the React frontend exists — no backend work needed, it reads these records directly.
 7. ☐ Only after the single-complaint pipeline works end-to-end (re-scoring loop + Trace Viewer working) — generalize to additional complaints per the slow V2 roadmap (Section 10).
 
-**Next concrete task: item 3 — the abstracted `call_agent()` function wrapping OpenRouter.**
+**Next concrete task: the remaining piece of item 5 — SSE streaming.** This is NOT a fresh start: `POST /api/triage`, `POST /api/answer`, the in-memory session store, and a working (throwaway) UI already exist and have proven the full data flow end-to-end in a browser. SSE replaces the "wait several seconds, then everything appears at once" experience with arm cards streaming in progressively as each agent finishes (CLAUDE.md Section 5 step 3, Section 7) — it does not replace the routes or pipeline already built. The pipeline functions (`run_triage`, `populate_questions`, `process_answer`) are all async and ready to be driven from a streaming endpoint.

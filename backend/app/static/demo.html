@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Clinical Reasoning Assistant — dev demo</title>
+  <style>
+    /* Deliberately plain. This page is throwaway scaffolding to drive the backend
+       in a browser, NOT the real (React) frontend — readability over design. */
+    :root { --line: #d8dee4; --muted: #5b6570; --accent: #2f6feb; --flag: #b42318; }
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      margin: 0; color: #1b1f24; background: #f6f8fa; line-height: 1.45;
+    }
+    header { background: #fff; border-bottom: 1px solid var(--line); padding: 16px 24px; }
+    header h1 { font-size: 18px; margin: 0; }
+    header p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+    main { display: grid; grid-template-columns: 1fr 360px; gap: 24px; padding: 24px; align-items: start; }
+    @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+
+    .panel { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
+    .panel h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 12px; }
+
+    form .row { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+    label { font-size: 12px; color: var(--muted); }
+    input[type=text] { padding: 8px; border: 1px solid var(--line); border-radius: 6px; font: inherit; width: 100%; }
+    button {
+      padding: 8px 14px; border: 1px solid var(--accent); background: var(--accent);
+      color: #fff; border-radius: 6px; font: inherit; cursor: pointer;
+    }
+    button.secondary { background: #fff; color: var(--accent); }
+    button:disabled { opacity: .5; cursor: default; }
+
+    #status { font-size: 13px; color: var(--muted); margin: 8px 0 0; min-height: 18px; }
+    #status.error { color: var(--flag); }
+
+    .arm { border: 1px solid var(--line); border-radius: 8px; padding: 14px; margin-bottom: 14px; }
+    .arm.deprioritized { opacity: .6; }
+    .arm-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+    .arm-name { font-weight: 600; }
+    .arm-score { font-variant-numeric: tabular-nums; font-weight: 600; }
+    .bar { height: 6px; background: #eaeef2; border-radius: 4px; margin: 8px 0; overflow: hidden; }
+    .bar > span { display: block; height: 100%; background: var(--accent); }
+    .reasoning { font-size: 13px; color: #333; margin: 6px 0; }
+    .reasoning.flag { color: var(--flag); }
+    .status-tag { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+
+    .q { border-top: 1px dashed var(--line); padding: 10px 0 4px; }
+    .q-text { font-size: 13px; font-weight: 500; }
+    .q-intent { font-size: 12px; color: var(--muted); margin: 2px 0 6px; }
+    .q-answer-row { display: flex; gap: 6px; }
+    .q-answer-row input { flex: 1; }
+    .answered { font-size: 12px; background: #eef6ee; border: 1px solid #cfe6cf; border-radius: 6px; padding: 6px 8px; }
+    .answered b { color: #1a7f37; }
+
+    /* Trace log (the manual Trace Viewer) */
+    #trace .entry { border: 1px solid var(--line); border-radius: 6px; padding: 10px; margin-bottom: 10px; font-size: 13px; }
+    #trace .trigger { color: var(--muted); margin-bottom: 6px; }
+    #trace .t-line { font-variant-numeric: tabular-nums; display: flex; justify-content: space-between; gap: 8px; }
+    #trace .up { color: #1a7f37; }
+    #trace .down { color: var(--flag); }
+    #trace .empty { color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Clinical Reasoning Assistant — dev demo</h1>
+    <p>Throwaway page to drive the agent loop in a browser. Assists history-taking; does not diagnose.</p>
+  </header>
+
+  <main>
+    <section>
+      <div class="panel" style="margin-bottom:24px;">
+        <h2>Start an interview</h2>
+        <form id="start-form">
+          <div class="row">
+            <label for="cc">Chief complaint</label>
+            <input type="text" id="cc" value="chest pain" />
+          </div>
+          <div class="row">
+            <label for="pc">Patient context</label>
+            <input type="text" id="pc" value="62-year-old male, smoker, pain worse on exertion, radiates to left arm" />
+          </div>
+          <button type="submit" id="start-btn">Start</button>
+          <p id="status"></p>
+        </form>
+      </div>
+
+      <div class="panel">
+        <h2>Diagnostic arms</h2>
+        <div id="arms"><p class="status-tag">No interview started yet.</p></div>
+      </div>
+    </section>
+
+    <aside class="panel">
+      <h2>Trace log — re-score history</h2>
+      <div id="trace"><p class="empty" style="font-size:13px;color:#5b6570;">Answer a question to see arm scores change here.</p></div>
+    </aside>
+  </main>
+
+  <script>
+    let sessionId = null;
+
+    const $ = (id) => document.getElementById(id);
+    const statusEl = $("status");
+
+    function setStatus(msg, isError = false) {
+      statusEl.textContent = msg || "";
+      statusEl.className = isError ? "error" : "";
+    }
+
+    // Small DOM helper: el("div", {class:"x"}, [childNodes / strings]).
+    function el(tag, props = {}, children = []) {
+      const node = document.createElement(tag);
+      for (const [k, v] of Object.entries(props)) {
+        if (k === "class") node.className = v;
+        else if (k === "text") node.textContent = v;
+        else node.setAttribute(k, v);
+      }
+      for (const child of [].concat(children)) {
+        if (child == null) continue;
+        node.appendChild(typeof child === "string" ? document.createTextNode(child) : child);
+      }
+      return node;
+    }
+
+    async function postJSON(url, body) {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        let detail = res.statusText;
+        try { detail = (await res.json()).detail || detail; } catch (_) {}
+        throw new Error(detail);
+      }
+      return res.json();
+    }
+
+    // --- Start interview -----------------------------------------------------
+    $("start-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const chief_complaint = $("cc").value.trim();
+      const patient_context = $("pc").value.trim();
+      if (!chief_complaint) { setStatus("Enter a chief complaint.", true); return; }
+
+      $("start-btn").disabled = true;
+      setStatus("Running triage and generating questions… (this takes several seconds)");
+      try {
+        const data = await postJSON("/api/triage", { chief_complaint, patient_context });
+        sessionId = data.session_id;
+        renderArms(data.triage);
+        setStatus("Interview started. Session " + sessionId.slice(0, 8) + "…");
+      } catch (err) {
+        setStatus("Failed to start: " + err.message, true);
+      } finally {
+        $("start-btn").disabled = false;
+      }
+    });
+
+    // --- Render arms ---------------------------------------------------------
+    function renderArms(triage) {
+      const container = $("arms");
+      container.innerHTML = "";
+      const arms = [...triage.arms].sort((a, b) => b.relevance_score - a.relevance_score);
+
+      for (const arm of arms) {
+        const pct = Math.round(arm.relevance_score * 100);
+        // A red-flag arm flagged by the prioritization agent leaves a tell in the
+        // reasoning text ("cannot be excluded"); highlight that line when present.
+        const flagged = /cannot be excluded|red flag/i.test(arm.reasoning);
+
+        const card = el("div", { class: "arm" + (arm.status === "deprioritized" ? " deprioritized" : "") }, [
+          el("div", { class: "arm-head" }, [
+            el("span", { class: "arm-name", text: arm.name }),
+            el("span", { class: "arm-score", text: arm.relevance_score.toFixed(2) + " (" + pct + "%)" }),
+          ]),
+          el("div", { class: "bar" }, [el("span", { style: "width:" + pct + "%" })]),
+          el("div", { class: "status-tag", text: arm.status }),
+          el("div", { class: "reasoning" + (flagged ? " flag" : ""), text: arm.reasoning }),
+        ]);
+
+        for (const q of arm.questions) {
+          card.appendChild(renderQuestion(q));
+        }
+        container.appendChild(card);
+      }
+    }
+
+    function renderQuestion(q) {
+      const wrap = el("div", { class: "q" }, [
+        el("div", { class: "q-text", text: q.text }),
+        el("div", { class: "q-intent", text: "Intent: " + q.diagnostic_intent }),
+      ]);
+
+      if (q.answered) {
+        wrap.appendChild(el("div", { class: "answered" }, [
+          el("b", { text: "Answered: " }),
+          el("span", { text: q.answer_text || "" }),
+        ]));
+        return wrap;
+      }
+
+      const input = el("input", { type: "text", placeholder: "Type the patient's answer…" });
+      const btn = el("button", { class: "secondary", text: "Submit answer" });
+      btn.addEventListener("click", () => submitAnswer(q.id, input.value.trim(), btn));
+      input.addEventListener("keydown", (e) => { if (e.key === "Enter") btn.click(); });
+      wrap.appendChild(el("div", { class: "q-answer-row" }, [input, btn]));
+      return wrap;
+    }
+
+    // --- Submit answer + re-score -------------------------------------------
+    async function submitAnswer(questionId, answerText, btn) {
+      if (!sessionId) { setStatus("Start an interview first.", true); return; }
+      if (!answerText) { setStatus("Type an answer before submitting.", true); return; }
+
+      btn.disabled = true;
+      const original = btn.textContent;
+      btn.textContent = "Re-scoring…";
+      setStatus("Re-scoring arms based on the answer… (several seconds)");
+      try {
+        const data = await postJSON("/api/answer", {
+          session_id: sessionId, question_id: questionId, answer_text: answerText,
+        });
+        renderArms(data.triage);            // fresh scores, reasoning, answered state
+        appendTrace(answerText, data.transitions);
+        setStatus("Re-score complete — " + data.transitions.length + " arm(s) changed.");
+      } catch (err) {
+        setStatus("Re-score failed: " + err.message, true);
+        btn.disabled = false;
+        btn.textContent = original;
+      }
+    }
+
+    // --- Trace log (accumulates across answers) ------------------------------
+    function appendTrace(answerText, transitions) {
+      const trace = $("trace");
+      if (trace.querySelector(".empty")) trace.innerHTML = "";
+
+      const entry = el("div", { class: "entry" }, [
+        el("div", { class: "trigger" }, [el("b", { text: "Answer: " }), el("span", { text: answerText })]),
+      ]);
+
+      if (!transitions.length) {
+        entry.appendChild(el("div", { class: "empty", text: "No arm scores changed." }));
+      } else {
+        // Show biggest movers first.
+        const sorted = [...transitions].sort(
+          (a, b) => Math.abs(b.new_score - b.old_score) - Math.abs(a.new_score - a.old_score)
+        );
+        for (const t of sorted) {
+          const delta = t.new_score - t.old_score;
+          const dir = delta > 0 ? "up" : "down";
+          const arrow = t.old_score.toFixed(2) + " → " + t.new_score.toFixed(2)
+            + " (" + (delta > 0 ? "+" : "") + delta.toFixed(2) + ")";
+          entry.appendChild(el("div", { class: "t-line" }, [
+            el("span", { text: t.arm_name }),
+            el("span", { class: dir, text: arrow }),
+          ]));
+        }
+      }
+      // Newest at the top so the latest re-score is immediately visible.
+      trace.insertBefore(entry, trace.firstChild);
+    }
+  </script>
+</body>
+</html>
