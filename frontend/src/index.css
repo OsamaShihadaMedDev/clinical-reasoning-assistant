@@ -1,0 +1,168 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+/* Typography — "Corporate Trust" pairing: Lexend for headings, Source Sans 3 for
+   body. Self-hosted via Fontsource (same mechanism shadcn used for its default
+   Geist), so no runtime Google Fonts request. */
+@import "@fontsource-variable/lexend";
+@import "@fontsource-variable/source-sans-3";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+    --font-sans: 'Source Sans 3 Variable', system-ui, sans-serif;
+    --font-heading: 'Lexend Variable', system-ui, sans-serif;
+
+    /* Brand tokens — the palette's "secondary" (#10B981) and a red-flag color live
+       here so data-viz chrome (the score gauge, status badges, red-flag reasoning)
+       can use bg-brand / text-brand-secondary / text-flag without hardcoding hex in
+       components. The semantic shadcn tokens below stay the source of truth for
+       surfaces/text. */
+    --color-brand: var(--brand);
+    --color-brand-foreground: var(--brand-foreground);
+    --color-brand-secondary: var(--brand-secondary);
+    --color-flag: var(--flag);
+
+    --color-sidebar-ring: var(--sidebar-ring);
+    --color-sidebar-border: var(--sidebar-border);
+    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+    --color-sidebar-accent: var(--sidebar-accent);
+    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+    --color-sidebar-primary: var(--sidebar-primary);
+    --color-sidebar-foreground: var(--sidebar-foreground);
+    --color-sidebar: var(--sidebar);
+    --color-chart-5: var(--chart-5);
+    --color-chart-4: var(--chart-4);
+    --color-chart-3: var(--chart-3);
+    --color-chart-2: var(--chart-2);
+    --color-chart-1: var(--chart-1);
+    --color-ring: var(--ring);
+    --color-input: var(--input);
+    --color-border: var(--border);
+    --color-destructive: var(--destructive);
+    --color-accent-foreground: var(--accent-foreground);
+    --color-accent: var(--accent);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-muted: var(--muted);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-secondary: var(--secondary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-primary: var(--primary);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-popover: var(--popover);
+    --color-card-foreground: var(--card-foreground);
+    --color-card: var(--card);
+    --color-foreground: var(--foreground);
+    --color-background: var(--background);
+    --radius-sm: calc(var(--radius) * 0.6);
+    --radius-md: calc(var(--radius) * 0.8);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) * 1.4);
+    --radius-2xl: calc(var(--radius) * 1.8);
+    --radius-3xl: calc(var(--radius) * 2.2);
+    --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+/* Sustainable Energy / Climate Tech palette mapped to shadcn semantic tokens.
+   primary/accent #059669, secondary #10B981, background #ECFDF5, text #064E3B,
+   border #A7F3D0. Note: shadcn's --accent token is the *hover surface* (must be a
+   light tint with dark text), which is NOT the palette's brand "accent" — that maps
+   to --primary. The brand secondary #10B981 lives in --brand-secondary above. */
+:root {
+    --background: #ecfdf5;          /* emerald-50 */
+    --foreground: #064e3b;          /* emerald-900 */
+    --card: #ffffff;
+    --card-foreground: #064e3b;
+    --popover: #ffffff;
+    --popover-foreground: #064e3b;
+    --primary: #059669;            /* emerald-600 — brand primary/accent */
+    --primary-foreground: #ffffff;
+    --secondary: #d1fae5;          /* emerald-100 — subtle secondary surface */
+    --secondary-foreground: #065f46;/* emerald-800 */
+    --muted: #d1fae5;              /* emerald-100 */
+    --muted-foreground: #4b7a68;   /* calm sage — secondary text, ~4.6:1 on white */
+    --accent: #a7f3d0;             /* emerald-200 — hover surface */
+    --accent-foreground: #064e3b;
+    --destructive: #b42318;        /* clinical red-flag red (parallels demo.html) */
+    --border: #a7f3d0;             /* emerald-200 */
+    --input: #a7f3d0;
+    --ring: #059669;
+    --chart-1: #059669;
+    --chart-2: #10b981;
+    --chart-3: #34d399;
+    --chart-4: #6ee7b7;
+    --chart-5: #a7f3d0;
+    --radius: 0.625rem;
+
+    --brand: #059669;
+    --brand-foreground: #ffffff;
+    --brand-secondary: #10b981;    /* emerald-500 — palette secondary, gauge/badges */
+    --flag: #b42318;
+
+    --sidebar: #ecfdf5;
+    --sidebar-foreground: #064e3b;
+    --sidebar-primary: #059669;
+    --sidebar-primary-foreground: #ffffff;
+    --sidebar-accent: #a7f3d0;
+    --sidebar-accent-foreground: #064e3b;
+    --sidebar-border: #a7f3d0;
+    --sidebar-ring: #059669;
+}
+
+/* Dark mode wired up now (cheap while in the theming file, expensive to retrofit)
+   even though no toggle is shipped yet — a deep emerald-tinted scheme. */
+.dark {
+    --background: #022c22;         /* emerald-950 */
+    --foreground: #d1fae5;
+    --card: #064e3b;              /* emerald-900 */
+    --card-foreground: #ecfdf5;
+    --popover: #064e3b;
+    --popover-foreground: #ecfdf5;
+    --primary: #10b981;           /* lifted for contrast on dark bg */
+    --primary-foreground: #022c22;
+    --secondary: #065f46;         /* emerald-800 */
+    --secondary-foreground: #ecfdf5;
+    --muted: #065f46;
+    --muted-foreground: #6ee7b7;
+    --accent: #047857;            /* emerald-700 — hover surface */
+    --accent-foreground: #ecfdf5;
+    --destructive: #f97066;
+    --border: oklch(0.92 0.05 165 / 15%);
+    --input: oklch(0.92 0.05 165 / 20%);
+    --ring: #10b981;
+    --chart-1: #10b981;
+    --chart-2: #34d399;
+    --chart-3: #6ee7b7;
+    --chart-4: #047857;
+    --chart-5: #a7f3d0;
+
+    --brand: #10b981;
+    --brand-foreground: #022c22;
+    --brand-secondary: #34d399;
+    --flag: #f97066;
+
+    --sidebar: #022c22;
+    --sidebar-foreground: #d1fae5;
+    --sidebar-primary: #10b981;
+    --sidebar-primary-foreground: #022c22;
+    --sidebar-accent: #047857;
+    --sidebar-accent-foreground: #ecfdf5;
+    --sidebar-border: oklch(0.92 0.05 165 / 15%);
+    --sidebar-ring: #10b981;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+    }
+  body {
+    @apply bg-background text-foreground;
+    }
+  html {
+    @apply font-sans;
+    }
+  h1, h2, h3, h4, h5, h6 {
+    @apply font-heading;
+    }
+}

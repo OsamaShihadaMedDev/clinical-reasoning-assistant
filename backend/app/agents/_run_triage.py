@@ -10,6 +10,7 @@ Edit the two constants below to try a different scenario.
 
 import asyncio
 
+from app.agents.framework_agent import resolve_framework
 from app.agents.triage import run_triage
 
 # One hardcoded chest-pain scenario for now. Edit these to test other patients.
@@ -20,7 +21,10 @@ PATIENT_CONTEXT = (
 
 
 async def main() -> None:
-    result = await run_triage(CHIEF_COMPLAINT, PATIENT_CONTEXT)
+    # Resolve the framework first (cache hit for a seeded complaint), then triage —
+    # mirrors what the /api/triage route now does.
+    framework = await resolve_framework(CHIEF_COMPLAINT)
+    result = await run_triage(framework, CHIEF_COMPLAINT, PATIENT_CONTEXT)
 
     print(f"Chief complaint: {result.chief_complaint}")
     print(f"Patient: {PATIENT_CONTEXT}\n")

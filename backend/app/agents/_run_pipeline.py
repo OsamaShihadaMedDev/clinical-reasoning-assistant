@@ -16,11 +16,12 @@ from typing import cast
 
 from pydantic import BaseModel
 
-from app.config import QUESTION_GENERATION_THRESHOLD, QUESTION_GENERATOR_MODEL
+from app.config import QUESTION_GENERATOR_MODEL
 from app.core.call_agent import call_agent
 from app.core.orchestration import populate_questions
 from app.core.rescore import process_answer
 from app.models import ClinicalQuestion
+from app.agents.framework_agent import resolve_framework
 from app.agents.triage import run_triage
 
 # Same hardcoded chest-pain scenario as _run_triage.py, for a like-for-like compare.
@@ -74,24 +75,24 @@ async def simulate_patient_answer(
 
 
 async def main() -> None:
+    # 0. Resolve the framework (cache hit for a seeded complaint, else generate it).
+    framework = await resolve_framework(CHIEF_COMPLAINT)
+
     # 1 & 2. Triage, then generate questions concurrently.
-    triage_output = await run_triage(CHIEF_COMPLAINT, PATIENT_CONTEXT)
-    qualifying_count = sum(
-        1
-        for arm in triage_output.arms
-        if arm.status == "active"
-        and arm.relevance_score >= QUESTION_GENERATION_THRESHOLD
-    )
+    triage_output = await run_triage(framework, CHIEF_COMPLAINT, PATIENT_CONTEXT)
     start = time.perf_counter()
     triage_output = await populate_questions(
         triage_output, CHIEF_COMPLAINT, PATIENT_CONTEXT
     )
     elapsed = time.perf_counter() - start
+    # With top-N auto-generate, only the top TOP_N_AUTO_GENERATE active arms get
+    # questions at triage time; count the arms that actually received them.
+    qualifying_count = sum(1 for arm in triage_output.arms if arm.questions)
 
     print(f"Chief complaint: {triage_output.chief_complaint}")
     print(f"Patient: {PATIENT_CONTEXT}")
     print(
-        f"Question generation: {qualifying_count} active arms, generated "
+        f"Question generation: {qualifying_count} arms auto-generated (top-N) "
         f"concurrently in {elapsed:.2f}s\n"
     )
     print("=== INITIAL TRIAGE + QUESTIONS ===")
@@ -128,7 +129,11 @@ async def main() -> None:
     old_scores = {arm.name: arm.relevance_score for arm in triage_output.arms}
     old_reasoning = {arm.name: arm.reasoning for arm in triage_output.arms}
     updated_triage, transitions = await process_answer(
-        chosen_question.id, answer_text, triage_output
+        chosen_question.id,
+        answer_text,
+        triage_output,
+        patient_context=PATIENT_CONTEXT,
+        framework=framework,
     )
 
     # 6. Before/after for EVERY arm, with the new reasoning shown.

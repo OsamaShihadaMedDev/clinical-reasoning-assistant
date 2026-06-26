@@ -1,36 +1,71 @@
-"""FastAPI app — the first HTTP surface over the working agent pipeline.
+"""FastAPI app — the HTTP surface over the working agent pipeline.
 
 This exposes the already-built, already-verified pipeline functions (`run_triage`,
-`populate_questions`, `process_answer`) over two routes, plus serves a throwaway
-plain-HTML demo page so the whole feedback loop can be driven in a browser by a human
-typing real answers. No SSE yet (CLAUDE.md Section 12 puts streaming after this), no
-React yet — the demo page is scaffolding, not the real frontend.
+`populate_questions`, `process_answer`) over HTTP, plus serves a throwaway plain-HTML
+demo page so the whole feedback loop can be driven in a browser by a human typing real
+answers. The demo page is scaffolding, not the real (React) frontend.
+
+Triage has TWO routes: a one-shot `POST /api/triage` (kept for tests/scripts that want
+a single response) and a streaming `GET /api/triage/stream` (SSE) that reveals arm
+cards progressively as each agent finishes. `POST /api/answer` is deliberately NOT
+streamed: re-scoring is a SINGLE combined agent call (CLAUDE.md Section 7), so there's
+no multi-step progressive reveal to stream — it returns one result in one shot.
 """
 
+import json
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
+from app.agents.framework_agent import resolve_framework
 from app.agents.triage import run_triage
-from app.core.orchestration import populate_questions
+from app.core.orchestration import (
+    ensure_arm_questions,
+    populate_questions,
+    populate_questions_streaming,
+)
 from app.core.rescore import process_answer
-from app.models import ScoreTransition, TriageOutput
+from app.models import DiagnosticArm, Framework, ScoreTransition, TriageOutput
 
 app = FastAPI(title="Clinical Reasoning Assistant")
 
 _STATIC_DIR = Path(__file__).parent / "static"
 
+
+@dataclass
+class _Session:
+    """Everything one ongoing interview needs to keep on the server.
+
+    Was just a bare `TriageOutput`, but lazy question generation (top-N auto-generate)
+    means a later /api/answer or /api/arm/expand call may need to generate questions
+    for an arm that had none — and to keep those tailored to the SAME patient the
+    initial fan-out saw, we must remember the `patient_context`. TriageOutput only
+    carries the chief_complaint, so the patient context is stored alongside it here.
+
+    `framework` (the diagnostic-arm framework resolved for this complaint) is also kept
+    because re-scoring needs this session's red-flag arm names, which live on the
+    framework and NOT on TriageOutput/DiagnosticArm. Stashing it once at session start
+    avoids re-resolving (and possibly re-generating) the framework on every answer.
+    """
+
+    triage: TriageOutput
+    patient_context: str
+    framework: Framework
+
+
 # In-memory session store. CLAUDE.md Section 7: session state is intentionally the
 # simplest possible thing for the MVP — a plain module-level dict, no Redis, no DB.
-# It keys an ongoing interview's current TriageOutput by a generated session id so a
-# follow-up /api/answer call can re-score the SAME interview. This resets if the
+# It keys an ongoing interview's state by a generated session id so a follow-up
+# /api/answer or /api/arm/expand call can act on the SAME interview. This resets if the
 # server restarts and isn't multi-process safe — both fine for a local single-user
 # demo, and the documented upgrade path (Redis) plugs in here without touching the
 # agents.
-_SESSIONS: dict[str, TriageOutput] = {}
+_SESSIONS: dict[str, _Session] = {}
 
 
 class TriageRequest(BaseModel):
@@ -54,6 +89,15 @@ class AnswerResponse(BaseModel):
     transitions: list[ScoreTransition]
 
 
+class ArmExpandRequest(BaseModel):
+    session_id: str
+    arm_name: str
+
+
+class ArmExpandResponse(BaseModel):
+    arm: DiagnosticArm
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -69,17 +113,105 @@ def demo_page() -> FileResponse:
 
 @app.post("/api/triage", response_model=TriageResponse)
 async def start_triage(request: TriageRequest) -> TriageResponse:
-    """Start an interview: score the arms, then generate questions for active arms —
-    exactly what the terminal pipeline runner does — and stash the result in the
-    session store so it can be re-scored later."""
-    triage = await run_triage(request.chief_complaint, request.patient_context)
+    """Start an interview: resolve the complaint's framework, score the arms, then
+    generate questions for active arms — exactly what the terminal pipeline runner
+    does — and stash the result in the session store so it can be re-scored later.
+
+    The Framework Agent runs FIRST (cache hit, or generate-and-cache on a brand-new
+    complaint), and its result is both fed to triage and stored on the session for the
+    re-scoring loop's red-flag check."""
+    framework = await resolve_framework(request.chief_complaint)
+    triage = await run_triage(
+        framework, request.chief_complaint, request.patient_context
+    )
     triage = await populate_questions(
         triage, request.chief_complaint, request.patient_context
     )
 
     session_id = uuid4().hex
-    _SESSIONS[session_id] = triage
+    _SESSIONS[session_id] = _Session(
+        triage=triage,
+        patient_context=request.patient_context,
+        framework=framework,
+    )
     return TriageResponse(session_id=session_id, triage=triage)
+
+
+def _sse(event: str, data: dict) -> str:
+    """Format one Server-Sent Event frame: a named `event:` line, a single-line JSON
+    `data:` line, and a blank line to terminate the frame. json.dumps emits no raw
+    newlines, so one data line is always sufficient here."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+async def _triage_event_stream(
+    chief_complaint: str, patient_context: str
+) -> AsyncIterator[str]:
+    """The SSE body for GET /api/triage/stream.
+
+    Emits, in order:
+      1. `triage`        — once run_triage() returns: all arms scored, questions still
+                           empty, so the frontend can render score cards immediately.
+      2. `arm_questions` — one per qualifying arm, the moment that arm's questions land
+                           (completion order, via populate_questions_streaming). Only
+                           that arm's data is sent, not the whole triage object again.
+      3. `done`          — once after every arm has streamed: carries the session_id,
+                           and the now-fully-populated TriageOutput is stored in
+                           _SESSIONS so /api/answer can re-score this same interview.
+
+    Any failure (triage call or an individual question-generation call) is surfaced as
+    an `error` event with a JSON `detail`, then the stream ends — never an unhandled
+    exception silently killing the connection.
+    """
+    # Stage 1: resolve the framework (cache hit or generate-and-cache), then triage
+    # scoring. Both run inside this try so a framework-resolution failure (e.g. a bad
+    # generation call) surfaces as a clean SSE `error` event, not an unhandled
+    # exception silently killing the stream — same fail-loud-to-client contract.
+    try:
+        framework = await resolve_framework(chief_complaint)
+        triage = await run_triage(framework, chief_complaint, patient_context)
+    except Exception as exc:  # noqa: BLE001 — surface ANY failure to the client cleanly
+        yield _sse("error", {"detail": f"Triage failed: {exc}"})
+        return
+
+    yield _sse("triage", triage.model_dump())
+
+    # Stage 2: stream each arm's questions as it completes. The generator mutates
+    # `triage` in place, so by the time it's exhausted `triage` is fully populated.
+    try:
+        async for arm, _questions in populate_questions_streaming(
+            triage, chief_complaint, patient_context
+        ):
+            yield _sse(
+                "arm_questions",
+                {"name": arm.name, "questions": [q.model_dump() for q in arm.questions]},
+            )
+    except Exception as exc:  # noqa: BLE001 — same fail-loud-to-client contract
+        yield _sse("error", {"detail": f"Question generation failed: {exc}"})
+        return
+
+    # Stage 3: persist the complete interview and hand back the session id.
+    session_id = uuid4().hex
+    _SESSIONS[session_id] = _Session(
+        triage=triage, patient_context=patient_context, framework=framework
+    )
+    yield _sse("done", {"session_id": session_id})
+
+
+@app.get("/api/triage/stream")
+async def stream_triage(
+    chief_complaint: str, patient_context: str = ""
+) -> StreamingResponse:
+    """Streaming counterpart to POST /api/triage. GET with query params because the
+    browser's EventSource can only issue a GET with no body. Same work as the one-shot
+    route, but delivered progressively over SSE."""
+    return StreamingResponse(
+        _triage_event_stream(chief_complaint, patient_context),
+        media_type="text/event-stream",
+        # no-cache + disabling proxy buffering keeps events flushing immediately
+        # rather than being held back and delivered as one batch.
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/api/answer", response_model=AnswerResponse)
@@ -87,8 +219,8 @@ async def answer_question(request: AnswerRequest) -> AnswerResponse:
     """Record one answer against an ongoing interview and re-score. Returns the
     updated state AND the ScoreTransition records for THIS answer (what the trace log
     renders)."""
-    current = _SESSIONS.get(request.session_id)
-    if current is None:
+    session = _SESSIONS.get(request.session_id)
+    if session is None:
         raise HTTPException(
             status_code=404,
             detail=(
@@ -99,13 +231,74 @@ async def answer_question(request: AnswerRequest) -> AnswerResponse:
         )
 
     # process_answer raises ValueError if the question id isn't in this session's
-    # arms. Surface that as a clear 400 rather than an opaque 500.
+    # arms. Surface that as a clear 400 rather than an opaque 500. The patient_context
+    # is passed so that if this answer promotes a quiet arm into the auto-generate top
+    # N, its newly-generated questions are tailored to the same patient.
     try:
         updated, transitions = await process_answer(
-            request.question_id, request.answer_text, current
+            request.question_id,
+            request.answer_text,
+            session.triage,
+            session.patient_context,
+            session.framework,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    _SESSIONS[request.session_id] = updated
+    _SESSIONS[request.session_id] = _Session(
+        triage=updated,
+        patient_context=session.patient_context,
+        framework=session.framework,
+    )
     return AnswerResponse(triage=updated, transitions=transitions)
+
+
+@app.post("/api/arm/expand", response_model=ArmExpandResponse)
+async def expand_arm(request: ArmExpandRequest) -> ArmExpandResponse:
+    """On-demand question generation for ONE arm the top-N fan-out skipped.
+
+    With top-N auto-generate (config.TOP_N_AUTO_GENERATE), only the highest-scoring
+    active arms get questions at triage time; the rest arrive with an empty list. When
+    the user expands one of those arms in the UI, the frontend calls this to fill it in.
+
+    Identified by arm_name in the JSON body rather than a URL path segment ON PURPOSE:
+    arm names contain spaces, parentheses and slashes (e.g. "Cardiac (ACS / Ischemic)"),
+    which are awkward/ambiguous in a path, and a JSON body matches the existing
+    /api/answer convention (session_id + payload in the body).
+
+    Idempotent: it delegates to `ensure_arm_questions`, which no-ops if the arm already
+    has questions — so the frontend can call it defensively without first checking, and
+    a double-click never regenerates or duplicates. Returns the arm's current state
+    (questions included) either way.
+    """
+    session = _SESSIONS.get(request.session_id)
+    if session is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No active session '{request.session_id}'. Start a new interview "
+                f"via POST /api/triage first (sessions are in-memory and reset when "
+                f"the server restarts)."
+            ),
+        )
+
+    arm = next(
+        (a for a in session.triage.arms if a.name == request.arm_name), None
+    )
+    if arm is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No arm named '{request.arm_name}' in session "
+                f"'{request.session_id}'. Use the exact arm name from the triage "
+                f"response."
+            ),
+        )
+
+    # No-op if already populated; otherwise generates and mutates the arm in place
+    # (so it's reflected in the stored session's TriageOutput).
+    await ensure_arm_questions(
+        arm, session.triage.chief_complaint, session.patient_context
+    )
+    _SESSIONS[request.session_id] = session  # arm mutated in place; re-store for clarity
+    return ArmExpandResponse(arm=arm)

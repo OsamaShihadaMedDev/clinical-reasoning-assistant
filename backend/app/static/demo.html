@@ -101,6 +101,7 @@
 
   <script>
     let sessionId = null;
+    let armCards = {};   // arm name -> its card element, so streamed questions can be appended
 
     const $ = (id) => document.getElementById(id);
     const statusEl = $("status");
@@ -139,31 +140,71 @@
       return res.json();
     }
 
-    // --- Start interview -----------------------------------------------------
-    $("start-form").addEventListener("submit", async (e) => {
+    // --- Start interview (SSE streaming) -------------------------------------
+    // Replaces the old one-shot POST /api/triage. Instead of waiting for the whole
+    // pipeline and rendering everything at once, we open an EventSource and react to
+    // three event types: scored cards appear on `triage`, then each card fills in its
+    // questions on its own `arm_questions` event as that agent finishes.
+    $("start-form").addEventListener("submit", (e) => {
       e.preventDefault();
       const chief_complaint = $("cc").value.trim();
       const patient_context = $("pc").value.trim();
       if (!chief_complaint) { setStatus("Enter a chief complaint.", true); return; }
 
       $("start-btn").disabled = true;
-      setStatus("Running triage and generating questions… (this takes several seconds)");
-      try {
-        const data = await postJSON("/api/triage", { chief_complaint, patient_context });
-        sessionId = data.session_id;
-        renderArms(data.triage);
-        setStatus("Interview started. Session " + sessionId.slice(0, 8) + "…");
-      } catch (err) {
-        setStatus("Failed to start: " + err.message, true);
-      } finally {
+      sessionId = null;
+      setStatus("Scoring arms…");
+
+      const url = "/api/triage/stream"
+        + "?chief_complaint=" + encodeURIComponent(chief_complaint)
+        + "&patient_context=" + encodeURIComponent(patient_context);
+      const es = new EventSource(url);
+      let completed = false;
+      let armsTotal = 0, armsFilled = 0;
+
+      es.addEventListener("triage", (ev) => {
+        const triage = JSON.parse(ev.data);   // arms scored, questions still empty
+        renderArms(triage);
+        armsTotal = triage.arms.filter((a) => a.status === "active").length;
+        setStatus("Arms scored — generating questions…");
+      });
+
+      es.addEventListener("arm_questions", (ev) => {
+        const d = JSON.parse(ev.data);         // { name, questions: [...] }
+        appendQuestionsToArm(d.name, d.questions);
+        armsFilled += 1;
+        setStatus("Generating questions… (" + armsFilled + "/" + armsTotal + " arms)");
+      });
+
+      es.addEventListener("done", (ev) => {
+        completed = true;
+        sessionId = JSON.parse(ev.data).session_id;
+        setStatus("Interview ready. Session " + sessionId.slice(0, 8) + "…");
+        es.close();
         $("start-btn").disabled = false;
-      }
+      });
+
+      // EventSource delivers BOTH our server-sent `event: error` (has .data) AND
+      // connection-level errors (no .data, e.g. the normal close after `done`).
+      // Distinguish them so a normal completion doesn't surface a scary message.
+      es.addEventListener("error", (ev) => {
+        if (ev.data) {
+          let detail = "stream error";
+          try { detail = JSON.parse(ev.data).detail || detail; } catch (_) {}
+          setStatus("Failed to start: " + detail, true);
+        } else if (!completed) {
+          setStatus("Connection to stream lost before completion.", true);
+        }
+        es.close();
+        $("start-btn").disabled = false;
+      });
     });
 
     // --- Render arms ---------------------------------------------------------
     function renderArms(triage) {
       const container = $("arms");
       container.innerHTML = "";
+      armCards = {};
       const arms = [...triage.arms].sort((a, b) => b.relevance_score - a.relevance_score);
 
       for (const arm of arms) {
@@ -185,7 +226,18 @@
         for (const q of arm.questions) {
           card.appendChild(renderQuestion(q));
         }
+        armCards[arm.name] = card;
         container.appendChild(card);
+      }
+    }
+
+    // Append questions to an already-rendered arm card as they stream in, instead of
+    // re-rendering the whole list (which would defeat the point of streaming).
+    function appendQuestionsToArm(armName, questions) {
+      const card = armCards[armName];
+      if (!card) return;  // arm wasn't rendered (e.g. below threshold) — nothing to fill
+      for (const q of questions) {
+        card.appendChild(renderQuestion(q));
       }
     }
 

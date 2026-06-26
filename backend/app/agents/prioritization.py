@@ -73,6 +73,22 @@ new answer does NOT actually rule it out, your reasoning for that arm MUST expli
 say it still cannot be excluded despite the low likelihood (call it a red flag). That \
 honest reasoning is the safety net — never a rigged number.
 
+INTERPRETING AMBIGUOUS OR COLLOQUIAL PATIENT LANGUAGE. Patients often describe \
+symptoms in informal, vague, or non-standard words rather than textbook clinical \
+descriptors. Do NOT treat unfamiliar phrasing as evidence of atypicality — the reflex \
+"this isn't a classic descriptor, therefore it lowers the likelihood" is a known error \
+and you must resist it. Instead, FIRST consider the most clinically plausible \
+interpretation(s) of what the patient likely means, and reason from that, not from the \
+strangeness of the words. Then keep two genuinely different conclusions separate \
+rather than collapsing them into one "unfamiliar -> atypical -> lower" reflex: \
+(a) once interpreted plausibly, the answer points TOWARD or AWAY from an arm — move \
+the score in that direction; versus (b) the wording is truly ambiguous and supports no \
+confident reading either way — here do NOT silently pick a direction. Say so in the \
+reasoning (e.g. "the patient's description is non-specific; cannot confidently move \
+the score on this answer alone") and leave the score where it is. This is the same \
+honesty principle as the red-flag check above: surface the uncertainty rather than \
+papering over it with a confident number.
+
 Hard rules:
 - Return EVERY arm you are given, each with its EXACT same name. Do not invent, \
 rename, merge, or drop any arm.
