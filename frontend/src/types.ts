@@ -43,11 +43,45 @@ export interface ScoreTransition {
   trigger_answer: string
 }
 
-/** Response body of `POST /api/answer` (see `AnswerResponse` in main.py): the
- *  updated triage plus only the arms whose score changed for this answer. */
+/** One question the Suggestion Agent picked for the "what to ask next" pool.
+ *  Mirrors `SuggestedQuestion` (backend/app/models/suggestion.py). References an
+ *  existing arm/history question by id; `question_text` is copied in so no second
+ *  lookup is needed. `is_history_question` tells the UI which answer route to use. */
+export interface SuggestedQuestion {
+  question_id: string
+  question_text: string
+  /** Arm name(s) this serves; empty for general-history questions. */
+  source_arms: string[]
+  /** One short clinical line (terser than `DiagnosticArm.reasoning`). */
+  justification: string
+  is_red_flag: boolean
+  is_history_question: boolean
+}
+
+/** The Suggestion Agent's ranked output. Mirrors `SuggestionBatch`. The array order
+ *  IS the ranking — do not re-sort (there is no numeric score by design). */
+export interface SuggestionBatch {
+  suggestions: SuggestedQuestion[]
+}
+
+/** Response body of `POST /api/answer` / `POST /api/answers` (see `AnswerResponse` in
+ *  main.py): the updated triage, only the arms whose score changed for this submit, and
+ *  the re-ranked suggestion pool. */
 export interface AnswerResponse {
   triage: TriageOutput
   transitions: ScoreTransition[]
+  suggestions: SuggestionBatch
+}
+
+/** Response body of `POST /api/triage` (see `TriageResponse` in main.py). NOTE: the
+ *  live frontend currently receives initial interview state over SSE
+ *  (`openTriageStream`), not this JSON route, so nothing consumes this interface yet —
+ *  it mirrors the contract for the upcoming step that streams `suggestions` over SSE. */
+export interface TriageResponse {
+  session_id: string
+  triage: TriageOutput
+  history: HistoryChecklist
+  suggestions: SuggestionBatch
 }
 
 /** Payload of the SSE `arm_questions` event: a single arm's just-generated

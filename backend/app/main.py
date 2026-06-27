@@ -30,13 +30,14 @@ from app.core.orchestration import (
     populate_questions,
     populate_questions_streaming,
 )
-from app.core.rescore import process_answers
+from app.core.rescore import build_suggestions, process_answers
 from app.models import (
     DiagnosticArm,
     Framework,
     HistoryAnswer,
     HistoryChecklist,
     ScoreTransition,
+    SuggestionBatch,
     TriageOutput,
 )
 
@@ -65,6 +66,11 @@ class _Session:
     id when one is answered. `history_answers` accumulates the answered general-history
     items across the session; the Prioritization Agent reads it as background context on
     every re-score (Step 8).
+
+    `suggestions` is the latest clinician-facing "what to ask next" pool (Suggestion
+    Agent). Defaulted to empty so a session can exist before one is computed: the SSE
+    triage path does NOT compute it yet (deferred to the SSE-suggestions follow-up), but
+    the very first /api/answers re-score recomputes it for that session regardless.
     """
 
     triage: TriageOutput
@@ -72,6 +78,9 @@ class _Session:
     framework: Framework
     history_checklist: HistoryChecklist
     history_answers: list[HistoryAnswer] = field(default_factory=list)
+    suggestions: SuggestionBatch = field(
+        default_factory=lambda: SuggestionBatch(suggestions=[])
+    )
 
 
 # In-memory session store. CLAUDE.md Section 7: session state is intentionally the
@@ -96,6 +105,12 @@ class TriageResponse(BaseModel):
     # field (NOT merged into TriageOutput) so the frontend renders it as a separate
     # card above the diagnostic arms. The History Agent runs before triage.
     history: HistoryChecklist
+    # The clinician-facing "what to ask next" pool, ranked at interview start (no score
+    # momentum yet). NOTE: the live React frontend gets its initial state over SSE, not
+    # this JSON route, so it does not consume this field yet — wiring suggestions onto
+    # the SSE stream is the next prompt. Returned here so the JSON route is contract-
+    # complete and testable via curl/demo.html now.
+    suggestions: SuggestionBatch
 
 
 class AnswerRequest(BaseModel):
@@ -119,6 +134,10 @@ class AnswerBatchRequest(BaseModel):
 class AnswerResponse(BaseModel):
     triage: TriageOutput
     transitions: list[ScoreTransition]
+    # The re-ranked "what to ask next" pool, recomputed on every re-score so it reflects
+    # the just-applied answers and any newly-promoted arm. (This field the React frontend
+    # WILL consume — /api/answers is plain JSON, not SSE.)
+    suggestions: SuggestionBatch
 
 
 class ArmExpandRequest(BaseModel):
@@ -162,14 +181,26 @@ async def start_triage(request: TriageRequest) -> TriageResponse:
         triage, request.chief_complaint, request.patient_context
     )
 
+    # Rank the initial suggestion pool so it's populated immediately at interview start,
+    # not only after the first answer. No transitions yet (nothing has moved).
+    suggestions = await build_suggestions(
+        triage, framework, history, history_answers=[], transitions=[]
+    )
+
     session_id = uuid4().hex
     _SESSIONS[session_id] = _Session(
         triage=triage,
         patient_context=request.patient_context,
         framework=framework,
         history_checklist=history,
+        suggestions=suggestions,
     )
-    return TriageResponse(session_id=session_id, triage=triage, history=history)
+    return TriageResponse(
+        session_id=session_id,
+        triage=triage,
+        history=history,
+        suggestions=suggestions,
+    )
 
 
 def _sse(event: str, data: dict) -> str:
@@ -285,7 +316,7 @@ async def _apply_answers(
     # process_answers appends history answers to session.history_answers IN PLACE, so the
     # session keeps them without us reassigning the list.
     try:
-        updated, transitions = await process_answers(
+        updated, transitions, suggestions = await process_answers(
             answers,
             session.triage,
             session.patient_context,
@@ -302,8 +333,9 @@ async def _apply_answers(
         framework=session.framework,
         history_checklist=session.history_checklist,
         history_answers=session.history_answers,
+        suggestions=suggestions,
     )
-    return AnswerResponse(triage=updated, transitions=transitions)
+    return AnswerResponse(triage=updated, transitions=transitions, suggestions=suggestions)
 
 
 @app.post("/api/answers", response_model=AnswerResponse)

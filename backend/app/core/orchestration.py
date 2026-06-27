@@ -21,6 +21,18 @@ from app.config import TOP_N_AUTO_GENERATE
 from app.models import ClinicalQuestion, DiagnosticArm, TriageOutput
 
 
+def _active_arms(triage_output: TriageOutput) -> list[DiagnosticArm]:
+    """Every arm the clinician has NOT deprioritized, in their existing order.
+
+    The single home of the active/deprioritized rule. Reused by `_qualifying_arms`
+    below (which then takes the top N for auto-generation) AND by the Suggestion Agent's
+    caller (which ranks across ALL active arms, not just the top N) — so the status
+    check isn't re-implemented per consumer (CLAUDE.md: one selection function, not
+    parallel copies).
+    """
+    return [arm for arm in triage_output.arms if arm.status == "active"]
+
+
 def _qualifying_arms(triage_output: TriageOutput) -> list[DiagnosticArm]:
     """The arms that get questions auto-generated: the top `TOP_N_AUTO_GENERATE`
     ACTIVE arms by score.
@@ -28,19 +40,22 @@ def _qualifying_arms(triage_output: TriageOutput) -> list[DiagnosticArm]:
     Shared by both population functions AND the post-rescore top-N check in
     `rescore.py`, so the "which arms auto-generate" rule lives in exactly one place
     (CLAUDE.md: prefer reusing one selection function over parallel copies). Two gates,
-    in order: status first (a deprioritized arm never qualifies, regardless of score),
-    then rank (only the N highest-scoring of what's left). Every other active arm keeps
-    its already-empty `questions` list and is generated LAZILY instead — on demand when
-    the user expands it, or automatically if a re-score later lifts it into the top N
-    (see `ensure_arm_questions`). That's the cost/scope control (CLAUDE.md Section 5/6):
-    question generation cost multiplies by arm count, so we don't pay it up front for
-    arms nobody is looking at yet.
+    in order: status first (a deprioritized arm never qualifies, regardless of score —
+    via `_active_arms`), then rank (only the N highest-scoring of what's left). Every
+    other active arm keeps its already-empty `questions` list and is generated LAZILY
+    instead — on demand when the user expands it, or automatically if a re-score later
+    lifts it into the top N (see `ensure_arm_questions`). That's the cost/scope control
+    (CLAUDE.md Section 5/6): question generation cost multiplies by arm count, so we
+    don't pay it up front for arms nobody is looking at yet.
     """
-    active = [arm for arm in triage_output.arms if arm.status == "active"]
     # Sort by score descending; ties resolve by the arms' existing order (Python's sort
     # is stable), which is good enough — the cutoff at N is a cost heuristic, not a
     # clinically meaningful boundary, and a re-score re-evaluates membership anyway.
-    active.sort(key=lambda arm: arm.relevance_score, reverse=True)
+    active = sorted(
+        _active_arms(triage_output),
+        key=lambda arm: arm.relevance_score,
+        reverse=True,
+    )
     return active[:TOP_N_AUTO_GENERATE]
 
 

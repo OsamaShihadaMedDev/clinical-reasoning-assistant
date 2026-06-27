@@ -128,7 +128,7 @@ async def main() -> None:
     # 5. Run the feedback loop.
     old_scores = {arm.name: arm.relevance_score for arm in triage_output.arms}
     old_reasoning = {arm.name: arm.reasoning for arm in triage_output.arms}
-    updated_triage, transitions = await process_answers(
+    updated_triage, transitions, _suggestions = await process_answers(
         [(chosen_question.id, answer_text)],
         triage_output,
         patient_context=PATIENT_CONTEXT,

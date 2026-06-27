@@ -10,7 +10,8 @@ Viewer (Section 6b) will later render — the visible proof the loop did somethi
 import asyncio
 
 from app.agents.prioritization import rescore_arms
-from app.core.orchestration import _qualifying_arms, ensure_arm_questions
+from app.agents.suggestion_agent import suggest_questions
+from app.core.orchestration import _active_arms, _qualifying_arms, ensure_arm_questions
 from app.models import (
     AnsweredQuestion,
     ClinicalQuestion,
@@ -19,6 +20,7 @@ from app.models import (
     HistoryChecklist,
     RescoreTrigger,
     ScoreTransition,
+    SuggestionBatch,
     TriageOutput,
     is_history_question_id,
 )
@@ -58,6 +60,33 @@ def _find_history_question_text(
     )
 
 
+async def build_suggestions(
+    triage: TriageOutput,
+    framework: Framework,
+    history_checklist: HistoryChecklist | None,
+    history_answers: list[HistoryAnswer],
+    transitions: list[ScoreTransition],
+) -> SuggestionBatch:
+    """Assemble the Suggestion Agent's inputs from session state and run it.
+
+    The SINGLE wiring point both the interview start (`/api/triage`, no transitions yet)
+    and the re-score path use, so the input assembly isn't duplicated. Active arms come
+    from the shared `orchestration._active_arms` filter (NOT the top-N `_qualifying_arms`
+    — the suggestion pool ranks across ALL active arms, not just the auto-generated
+    top N); the red-flag arm names are derived from the framework, the same source the
+    re-score safety check uses.
+    """
+    red_flag_arm_names = {arm.name for arm in framework.arms if arm.red_flag}
+    return await suggest_questions(
+        chief_complaint=triage.chief_complaint,
+        active_arms=_active_arms(triage),
+        history_checklist=history_checklist,
+        history_answers=history_answers,
+        red_flag_arm_names=red_flag_arm_names,
+        transitions=transitions,
+    )
+
+
 async def process_answers(
     answers: list[tuple[str, str]],
     current_triage: TriageOutput,
@@ -65,7 +94,7 @@ async def process_answers(
     framework: Framework,
     history_checklist: HistoryChecklist | None = None,
     history_answers: list[HistoryAnswer] | None = None,
-) -> tuple[TriageOutput, list[ScoreTransition]]:
+) -> tuple[TriageOutput, list[ScoreTransition], SuggestionBatch]:
     """Apply a BATCH of answered questions to the interview and re-score ONCE.
 
     This is the card-level-submit version: a clinician fills several fields in one card
@@ -73,8 +102,10 @@ async def process_answers(
     regardless of how many questions were answered. A single-answer submit is just the
     one-element batch (`len(answers) == 1`) — no special-casing.
 
-    Returns the updated `TriageOutput` AND the `ScoreTransition` records for arms whose
-    score actually moved (what the Trace Viewer renders).
+    Returns the updated `TriageOutput`, the `ScoreTransition` records for arms whose
+    score actually moved (what the Trace Viewer renders), AND a freshly-ranked
+    `SuggestionBatch` (the clinician-facing "what to ask next" pool, recomputed over the
+    FINAL merged state so it reflects the just-applied answers and the promoted arms).
 
     ONE re-score path, TWO input shapes per item. Each answered question is EITHER an
     arm question OR a general-history question; we tell them apart by the id alone
@@ -203,4 +234,12 @@ async def process_answers(
             )
         )
 
-    return updated_triage, transitions
+    # 6. Rank the clinician-facing suggestion pool over the FINAL merged state — after
+    #    the re-score AND after any newly-promoted arm's questions exist, so those are
+    #    in the candidate pool too. The momentum (`transitions`) just computed is fed in
+    #    so the agent can weight arms that moved sharply.
+    suggestions = await build_suggestions(
+        updated_triage, framework, history_checklist, history_answers, transitions
+    )
+
+    return updated_triage, transitions, suggestions

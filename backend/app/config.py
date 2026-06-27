@@ -23,6 +23,27 @@ TRIAGE_MODEL = "anthropic/claude-haiku-4.5"
 QUESTION_GENERATOR_MODEL = "anthropic/claude-haiku-4.5"
 PRIORITIZATION_MODEL = "anthropic/claude-sonnet-4.5"
 
+# Routing for the Suggestion Agent (backend/app/agents/suggestion_agent.py), which runs
+# on EVERY re-score (same cadence as PRIORITIZATION_MODEL) AND once at interview start,
+# to rank which already-existing unanswered questions to surface in the clinician-facing
+# suggestion pool. This is a SELECTION task over already-generated content, not a
+# diagnostic judgment — the hard clinical reasoning already happened upstream in Triage,
+# the Question Generator, and Prioritization. So it routes cheap/fast like TRIAGE_MODEL
+# and QUESTION_GENERATOR_MODEL, NOT at PRIORITIZATION_MODEL's tier: a wrong
+# suggestion-pool pick is correctable on the next re-score (the clinician can always
+# ignore a suggestion and ask their own card's questions instead), unlike a buried
+# red-flag score, so the safety argument for the stronger tier does not apply here.
+SUGGESTION_MODEL = "anthropic/claude-haiku-4.5"
+
+# How many suggestions the pool returns (the agent's ranked top picks, capped here).
+# The agent is allowed to return FEWER when no further question is worth surfacing
+# (e.g. every remaining arm has sunk low) — it must not pad to hit this number.
+# NOTE: the longer-term design is a frontend "show N more" affordance on top of a
+# larger backend list; if/when that lands, split this into a separate (larger) return
+# cap vs this fold count. For now this single constant is both the agent's target and
+# the hard truncation cap in the merge step.
+SUGGESTION_POOL_SIZE = 4
+
 # Routing for the Framework Agent (backend/app/agents/framework_agent.py), which
 # runs BEFORE triage to resolve a diagnostic-arm framework for the chief complaint.
 # Two very different call profiles, so two different tiers:
