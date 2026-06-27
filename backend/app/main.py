@@ -1,7 +1,7 @@
 """FastAPI app — the HTTP surface over the working agent pipeline.
 
 This exposes the already-built, already-verified pipeline functions (`run_triage`,
-`populate_questions`, `process_answer`) over HTTP, plus serves a throwaway plain-HTML
+`populate_questions`, `process_answers`) over HTTP, plus serves a throwaway plain-HTML
 demo page so the whole feedback loop can be driven in a browser by a human typing real
 answers. The demo page is scaffolding, not the real (React) frontend.
 
@@ -14,7 +14,7 @@ no multi-step progressive reveal to stream — it returns one result in one shot
 
 import json
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
@@ -23,14 +23,22 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from app.agents.framework_agent import resolve_framework
+from app.agents.history_agent import resolve_history_checklist
 from app.agents.triage import run_triage
 from app.core.orchestration import (
     ensure_arm_questions,
     populate_questions,
     populate_questions_streaming,
 )
-from app.core.rescore import process_answer
-from app.models import DiagnosticArm, Framework, ScoreTransition, TriageOutput
+from app.core.rescore import process_answers
+from app.models import (
+    DiagnosticArm,
+    Framework,
+    HistoryAnswer,
+    HistoryChecklist,
+    ScoreTransition,
+    TriageOutput,
+)
 
 app = FastAPI(title="Clinical Reasoning Assistant")
 
@@ -51,11 +59,19 @@ class _Session:
     because re-scoring needs this session's red-flag arm names, which live on the
     framework and NOT on TriageOutput/DiagnosticArm. Stashing it once at session start
     avoids re-resolving (and possibly re-generating) the framework on every answer.
+
+    `history_checklist` (the general-history checklist resolved for this patient's
+    population) is kept so /api/answer can look up a general-history question's text by
+    id when one is answered. `history_answers` accumulates the answered general-history
+    items across the session; the Prioritization Agent reads it as background context on
+    every re-score (Step 8).
     """
 
     triage: TriageOutput
     patient_context: str
     framework: Framework
+    history_checklist: HistoryChecklist
+    history_answers: list[HistoryAnswer] = field(default_factory=list)
 
 
 # In-memory session store. CLAUDE.md Section 7: session state is intentionally the
@@ -76,12 +92,28 @@ class TriageRequest(BaseModel):
 class TriageResponse(BaseModel):
     session_id: str
     triage: TriageOutput
+    # The general-history checklist for this patient's population, returned as its OWN
+    # field (NOT merged into TriageOutput) so the frontend renders it as a separate
+    # card above the diagnostic arms. The History Agent runs before triage.
+    history: HistoryChecklist
 
 
 class AnswerRequest(BaseModel):
     session_id: str
     question_id: str
     answer_text: str
+
+
+class AnswerItem(BaseModel):
+    """One (question_id, answer_text) pair within a card-level batch submission."""
+
+    question_id: str
+    answer_text: str
+
+
+class AnswerBatchRequest(BaseModel):
+    session_id: str
+    answers: list[AnswerItem]
 
 
 class AnswerResponse(BaseModel):
@@ -113,13 +145,15 @@ def demo_page() -> FileResponse:
 
 @app.post("/api/triage", response_model=TriageResponse)
 async def start_triage(request: TriageRequest) -> TriageResponse:
-    """Start an interview: resolve the complaint's framework, score the arms, then
-    generate questions for active arms — exactly what the terminal pipeline runner
-    does — and stash the result in the session store so it can be re-scored later.
+    """Start an interview: resolve the general-history checklist (by patient
+    population), then the complaint's framework, score the arms, generate questions for
+    active arms, and stash everything in the session store so it can be re-scored later.
 
-    The Framework Agent runs FIRST (cache hit, or generate-and-cache on a brand-new
-    complaint), and its result is both fed to triage and stored on the session for the
-    re-scoring loop's red-flag check."""
+    Agent order: History Agent FIRST (classify population, load/generate the general-
+    history checklist), THEN Framework Agent (load/generate the complaint framework),
+    THEN triage + question generation. The history checklist is returned as its own
+    response field and is independent of the complaint-specific arms."""
+    history = await resolve_history_checklist(request.patient_context)
     framework = await resolve_framework(request.chief_complaint)
     triage = await run_triage(
         framework, request.chief_complaint, request.patient_context
@@ -133,8 +167,9 @@ async def start_triage(request: TriageRequest) -> TriageResponse:
         triage=triage,
         patient_context=request.patient_context,
         framework=framework,
+        history_checklist=history,
     )
-    return TriageResponse(session_id=session_id, triage=triage)
+    return TriageResponse(session_id=session_id, triage=triage, history=history)
 
 
 def _sse(event: str, data: dict) -> str:
@@ -150,24 +185,30 @@ async def _triage_event_stream(
     """The SSE body for GET /api/triage/stream.
 
     Emits, in order:
+      0. `history`       — once the History Agent resolves the general-history checklist
+                           (classify population, load/generate): the frontend renders the
+                           General History card immediately, before any arms.
       1. `triage`        — once run_triage() returns: all arms scored, questions still
                            empty, so the frontend can render score cards immediately.
       2. `arm_questions` — one per qualifying arm, the moment that arm's questions land
                            (completion order, via populate_questions_streaming). Only
                            that arm's data is sent, not the whole triage object again.
       3. `done`          — once after every arm has streamed: carries the session_id,
-                           and the now-fully-populated TriageOutput is stored in
-                           _SESSIONS so /api/answer can re-score this same interview.
+                           and the now-fully-populated TriageOutput (plus the history
+                           checklist) is stored in _SESSIONS so /api/answer can re-score
+                           this same interview.
 
-    Any failure (triage call or an individual question-generation call) is surfaced as
-    an `error` event with a JSON `detail`, then the stream ends — never an unhandled
+    Any failure (history, framework, triage, or a question-generation call) is surfaced
+    as an `error` event with a JSON `detail`, then the stream ends — never an unhandled
     exception silently killing the connection.
     """
-    # Stage 1: resolve the framework (cache hit or generate-and-cache), then triage
-    # scoring. Both run inside this try so a framework-resolution failure (e.g. a bad
-    # generation call) surfaces as a clean SSE `error` event, not an unhandled
-    # exception silently killing the stream — same fail-loud-to-client contract.
+    # Stage 0/1: resolve the general-history checklist, then the framework, then triage
+    # scoring. All inside this try so ANY resolution failure surfaces as a clean SSE
+    # `error` event, not an unhandled exception silently killing the stream.
     try:
+        history = await resolve_history_checklist(patient_context)
+        yield _sse("history", history.model_dump(mode="json"))
+
         framework = await resolve_framework(chief_complaint)
         triage = await run_triage(framework, chief_complaint, patient_context)
     except Exception as exc:  # noqa: BLE001 — surface ANY failure to the client cleanly
@@ -193,7 +234,10 @@ async def _triage_event_stream(
     # Stage 3: persist the complete interview and hand back the session id.
     session_id = uuid4().hex
     _SESSIONS[session_id] = _Session(
-        triage=triage, patient_context=patient_context, framework=framework
+        triage=triage,
+        patient_context=patient_context,
+        framework=framework,
+        history_checklist=history,
     )
     yield _sse("done", {"session_id": session_id})
 
@@ -214,43 +258,78 @@ async def stream_triage(
     )
 
 
-@app.post("/api/answer", response_model=AnswerResponse)
-async def answer_question(request: AnswerRequest) -> AnswerResponse:
-    """Record one answer against an ongoing interview and re-score. Returns the
-    updated state AND the ScoreTransition records for THIS answer (what the trace log
-    renders)."""
-    session = _SESSIONS.get(request.session_id)
+async def _apply_answers(
+    session_id: str, answers: list[tuple[str, str]]
+) -> AnswerResponse:
+    """Shared body for both answer routes: look up the session, run the ONE batch
+    re-score, persist, and return. The single-answer route passes a one-item list; the
+    batch route passes the whole card. Keeping ONE implementation here (rather than two
+    parallel route bodies) is what makes the singular route a true thin wrapper and not
+    a second code path that can drift."""
+    session = _SESSIONS.get(session_id)
     if session is None:
         raise HTTPException(
             status_code=404,
             detail=(
-                f"No active session '{request.session_id}'. Start a new interview "
+                f"No active session '{session_id}'. Start a new interview "
                 f"via POST /api/triage first (sessions are in-memory and reset when "
                 f"the server restarts)."
             ),
         )
 
-    # process_answer raises ValueError if the question id isn't in this session's
-    # arms. Surface that as a clear 400 rather than an opaque 500. The patient_context
-    # is passed so that if this answer promotes a quiet arm into the auto-generate top
-    # N, its newly-generated questions are tailored to the same patient.
+    # process_answers raises ValueError if any question id isn't found (in the arms for
+    # an arm answer, or in the checklist for a history answer). Surface that as a clean
+    # 400, not an opaque 500. patient_context is passed so a promotion into the top N
+    # generates tailored questions; history_checklist/history_answers let general-history
+    # answers be recorded and fed to the re-score as background context. NOTE:
+    # process_answers appends history answers to session.history_answers IN PLACE, so the
+    # session keeps them without us reassigning the list.
     try:
-        updated, transitions = await process_answer(
-            request.question_id,
-            request.answer_text,
+        updated, transitions = await process_answers(
+            answers,
             session.triage,
             session.patient_context,
             session.framework,
+            history_checklist=session.history_checklist,
+            history_answers=session.history_answers,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    _SESSIONS[request.session_id] = _Session(
+    _SESSIONS[session_id] = _Session(
         triage=updated,
         patient_context=session.patient_context,
         framework=session.framework,
+        history_checklist=session.history_checklist,
+        history_answers=session.history_answers,
     )
     return AnswerResponse(triage=updated, transitions=transitions)
+
+
+@app.post("/api/answers", response_model=AnswerResponse)
+async def answer_questions_batch(request: AnswerBatchRequest) -> AnswerResponse:
+    """Record one or more answers from a SINGLE card submission and re-score ONCE.
+
+    This is the primary answer route the React frontend uses: a card-level submit sends
+    every newly-answered question in that card together, costing exactly one
+    Prioritization call regardless of how many were answered, and letting the agent
+    reason over them jointly. Answers may be arm questions or general-history questions
+    (process_answers routes each by its id)."""
+    return await _apply_answers(
+        request.session_id,
+        [(a.question_id, a.answer_text) for a in request.answers],
+    )
+
+
+@app.post("/api/answer", response_model=AnswerResponse)
+async def answer_question(request: AnswerRequest) -> AnswerResponse:
+    """Single-answer compatibility route — a thin one-item wrapper over the same batch
+    machinery (`/api/answers`). Kept because the throwaway demo.html still posts one
+    answer at a time here; the React frontend uses `/api/answers`. Not a parallel
+    implementation — it delegates straight into `_apply_answers`."""
+    return await _apply_answers(
+        request.session_id, [(request.question_id, request.answer_text)]
+    )
 
 
 @app.post("/api/arm/expand", response_model=ArmExpandResponse)

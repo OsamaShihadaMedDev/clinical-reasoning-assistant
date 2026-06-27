@@ -9,10 +9,11 @@ import { useState } from "react"
 
 import { ComplaintBar } from "@/components/ComplaintBar"
 import { DiagnosticArmCard } from "@/components/DiagnosticArmCard"
+import { HistoryCard } from "@/components/HistoryCard"
 import { TraceLogPanel } from "@/components/TraceLogPanel"
 import { Accordion } from "@/components/ui/accordion"
 import { Skeleton } from "@/components/ui/skeleton"
-import { useInterview } from "@/hooks/useInterview"
+import { HISTORY_CARD_ID, useInterview } from "@/hooks/useInterview"
 
 /** Placeholder cards shown after submit but before the `triage` event lands. */
 function ScoringSkeletons() {
@@ -60,7 +61,17 @@ export default function App() {
       >
         {iv.started && (
           <div className="grid items-start gap-6 lg:grid-cols-[1fr_340px]">
-            <section aria-label="Diagnostic arms">
+            <div className="min-w-0 space-y-3">
+              {iv.historyChecklist && (
+                <HistoryCard
+                  checklist={iv.historyChecklist}
+                  answeredHistory={iv.answeredHistory}
+                  submitting={iv.submittingArm === HISTORY_CARD_ID}
+                  busy={busy}
+                  onAnswerBatch={iv.answerBatch}
+                />
+              )}
+              <section aria-label="Diagnostic arms">
               {iv.arms.length === 0 ? (
                 <ScoringSkeletons />
               ) : (
@@ -86,14 +97,15 @@ export default function App() {
                       transition={iv.recentTransitions[arm.name]}
                       generating={generating}
                       expanding={iv.expandingArms.has(arm.name)}
-                      answeringId={iv.answeringId}
+                      submitting={iv.submittingArm === arm.name}
                       busy={busy}
-                      onAnswer={iv.answer}
+                      onAnswerBatch={iv.answerBatch}
                     />
                   ))}
                 </Accordion>
               )}
-            </section>
+              </section>
+            </div>
 
             <aside className="lg:sticky" style={{ top: barHeight + 24 }}>
               <TraceLogPanel entries={iv.traceLog} />

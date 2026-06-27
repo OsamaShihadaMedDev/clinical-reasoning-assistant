@@ -57,6 +57,38 @@ export interface ArmQuestionsEvent {
   questions: ClinicalQuestion[]
 }
 
+/** Patient population category. Mirrors the backend `PatientCategory` enum's
+ *  string values (history.py). */
+export type PatientCategory =
+  | "pediatric"
+  | "ob_gyn"
+  | "surgical"
+  | "geriatric"
+  | "adult_general"
+
+/** One general-history question in a population checklist. Mirrors `HistoryQuestion`.
+ *  Note the fields differ from ClinicalQuestion: `question_text`/`rationale`, and no
+ *  score/intent — these aren't weighed against each other like diagnostic arms. */
+export interface HistoryQuestion {
+  id: string
+  question_text: string
+  rationale: string
+}
+
+/** The general-history checklist for a patient's population. Mirrors `HistoryChecklist`
+ *  and is the payload of the SSE `history` event (and the `history` field on the
+ *  POST /api/triage response). Rendered as its own card above the diagnostic arms. */
+export interface HistoryChecklist {
+  category: PatientCategory
+  questions: HistoryQuestion[]
+  /** True only when classification fell back to adult_general for lack of context —
+   *  drives whether the assumption note shows (CLAUDE.md-style "did we have to guess"). */
+  assumed_default: boolean
+  /** Always populated; the literal text shown in the assumption note when
+   *  `assumed_default` is true. */
+  category_reasoning: string
+}
+
 /** Response body of `POST /api/arm/expand` (see `ArmExpandResponse` in main.py):
  *  the single arm with its questions filled in. Backend top-N auto-generate means
  *  arms outside the top 3 arrive with an empty `questions` list; expanding one in

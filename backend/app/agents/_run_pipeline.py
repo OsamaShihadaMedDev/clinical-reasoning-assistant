@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from app.config import QUESTION_GENERATOR_MODEL
 from app.core.call_agent import call_agent
 from app.core.orchestration import populate_questions
-from app.core.rescore import process_answer
+from app.core.rescore import process_answers
 from app.models import ClinicalQuestion
 from app.agents.framework_agent import resolve_framework
 from app.agents.triage import run_triage
@@ -128,9 +128,8 @@ async def main() -> None:
     # 5. Run the feedback loop.
     old_scores = {arm.name: arm.relevance_score for arm in triage_output.arms}
     old_reasoning = {arm.name: arm.reasoning for arm in triage_output.arms}
-    updated_triage, transitions = await process_answer(
-        chosen_question.id,
-        answer_text,
+    updated_triage, transitions = await process_answers(
+        [(chosen_question.id, answer_text)],
         triage_output,
         patient_context=PATIENT_CONTEXT,
         framework=framework,

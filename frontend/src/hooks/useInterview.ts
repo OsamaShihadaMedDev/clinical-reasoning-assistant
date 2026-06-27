@@ -12,8 +12,17 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
-import { expandArm as expandArmRequest, openTriageStream, submitAnswer } from "@/api/client"
-import type { DiagnosticArm, ScoreTransition, TriageOutput } from "@/types"
+import { expandArm as expandArmRequest, openTriageStream, submitAnswers } from "@/api/client"
+import type {
+  DiagnosticArm,
+  HistoryChecklist,
+  ScoreTransition,
+  TriageOutput,
+} from "@/types"
+
+/** Card identity used for the General History card in `submittingArm` (arm cards use
+ *  their arm name). A sentinel that can't collide with a real arm name. */
+export const HISTORY_CARD_ID = "__history__"
 
 /** Streaming status surfaced near the docked bar (drives StreamingStatus). */
 export type StreamStatus =
@@ -58,6 +67,12 @@ function computeLeader(
 export function useInterview() {
   const [started, setStarted] = useState(false)
   const [triage, setTriage] = useState<TriageOutput | null>(null)
+  // General-history checklist (arrives on the SSE `history` event, before triage) and
+  // the locally-tracked answers to it. We track answeredHistory client-side because
+  // /api/answer returns only the re-scored arms+transitions, not the history state.
+  const [historyChecklist, setHistoryChecklist] =
+    useState<HistoryChecklist | null>(null)
+  const [answeredHistory, setAnsweredHistory] = useState<Record<string, string>>({})
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [status, setStatus] = useState<StreamStatus>({ kind: "idle" })
   const [openArms, setOpenArms] = useState<string[]>([])
@@ -66,7 +81,10 @@ export function useInterview() {
   const [recentTransitions, setRecentTransitions] = useState<
     Record<string, ScoreTransition>
   >({})
-  const [answeringId, setAnsweringId] = useState<string | null>(null)
+  // Which card currently has a batch submit in flight (an arm name, or HISTORY_CARD_ID
+  // for the General History card). Replaces the old per-question answeringId — a
+  // card-level submit no longer maps to a single question id.
+  const [submittingArm, setSubmittingArm] = useState<string | null>(null)
   // Arm names whose questions are being lazily generated on demand (top-N fan-out
   // skipped them; the user just expanded one). Drives a per-arm loading skeleton.
   const [expandingArms, setExpandingArms] = useState<Set<string>>(new Set())
@@ -109,6 +127,8 @@ export function useInterview() {
       cleanupRef.current?.()
       setStarted(true)
       setTriage(null)
+      setHistoryChecklist(null)
+      setAnsweredHistory({})
       setSessionId(null)
       setOpenArms([])
       setLeaderName(null)
@@ -118,6 +138,7 @@ export function useInterview() {
       setStatus({ kind: "scoring" })
 
       cleanupRef.current = openTriageStream(chiefComplaint, patientContext, {
+        onHistory: (checklist) => setHistoryChecklist(checklist),
         onTriage: (t) => {
           setTriage(t)
           const total = t.arms.filter((a) => a.status === "active").length
@@ -150,36 +171,62 @@ export function useInterview() {
     [],
   )
 
-  const answer = useCallback(
-    async (questionId: string, answerText: string) => {
-      if (!sessionId) return
-      setAnsweringId(questionId)
+  // Submit a BATCH of answers from ONE card (arm card or General History card) and
+  // re-score once. `cardId` is the submitting card's identity (arm name, or
+  // HISTORY_CARD_ID) — only used to drive the card-level loading state. Returns whether
+  // the submit succeeded, so the card can clear exactly the drafts it submitted.
+  const answerBatch = useCallback(
+    async (
+      cardId: string,
+      answers: { question_id: string; answer_text: string }[],
+    ): Promise<boolean> => {
+      if (!sessionId || answers.length === 0) return false
+      setSubmittingArm(cardId)
       setStatus({ kind: "rescoring" })
       try {
-        const res = await submitAnswer(sessionId, questionId, answerText)
+        const res = await submitAnswers(sessionId, answers)
         setTriage(res.triage)
 
+        // Record any general-history answers in this batch locally (the response
+        // carries only arms+transitions, not history state). Detected by membership in
+        // the checklist rather than an id prefix, so the frontend keeps no knowledge of
+        // the backend id format.
+        const historyIds = new Set(
+          historyChecklist?.questions.map((q) => q.id) ?? [],
+        )
+        const newlyAnswered: Record<string, string> = {}
+        for (const a of answers) {
+          if (historyIds.has(a.question_id)) newlyAnswered[a.question_id] = a.answer_text
+        }
+        if (Object.keys(newlyAnswered).length > 0) {
+          setAnsweredHistory((prev) => ({ ...prev, ...newlyAnswered }))
+        }
+
         // Transient per-arm old->new indicator. Replacing the whole map (rather than
-        // merging) means only arms that moved on THIS answer carry a fresh object,
+        // merging) means only arms that moved on THIS submit carry a fresh object,
         // so each ScoreTransitionIndicator self-fades exactly once per change.
         const map: Record<string, ScoreTransition> = {}
         for (const t of res.transitions) map[t.arm_name] = t
         setRecentTransitions(map)
 
-        // Trace log entry, newest first (matching demo.html's insertBefore order).
+        // Trace log entry, newest first. The answer is the batch joined into one
+        // string, matching the backend's joined ScoreTransition.trigger_answer.
+        const joined = answers.map((a) => a.answer_text).join("; ")
         traceIdRef.current += 1
         setTraceLog((log) => [
-          { id: traceIdRef.current, answer: answerText, transitions: res.transitions },
+          { id: traceIdRef.current, answer: joined, transitions: res.transitions },
           ...log,
         ])
         setStatus({ kind: "ready" })
+        return true
       } catch (e) {
         setStatus({ kind: "error", detail: (e as Error).message })
+        return false
       } finally {
-        setAnsweringId(null)
+        setSubmittingArm(null)
       }
     },
-    [sessionId],
+    [sessionId, historyChecklist],
   )
 
   // Lazily generate questions for ONE arm the top-N fan-out skipped, the moment the
@@ -236,6 +283,8 @@ export function useInterview() {
     started,
     triage,
     arms,
+    historyChecklist,
+    answeredHistory,
     sessionId,
     status,
     openArms,
@@ -243,10 +292,10 @@ export function useInterview() {
     leaderName,
     traceLog,
     recentTransitions,
-    answeringId,
+    submittingArm,
     expandingArms,
     start,
-    answer,
+    answerBatch,
     expandArm,
   }
 }

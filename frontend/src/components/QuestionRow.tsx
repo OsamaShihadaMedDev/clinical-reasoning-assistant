@@ -4,34 +4,33 @@
  * every question shows *why* it's asked, but it must not compete visually with the
  * question itself).
  *
- * Two clearly distinct states (ux-guidelines: answered/unanswered must not look
- * near-identical): unanswered shows an answer field + submit; answered renders as a
- * settled, read-only row with the captured answer.
+ * Submission is now CARD-LEVEL, not per-row: this row no longer owns a form or submit
+ * button. Unanswered, it is a controlled input that reports its draft up to the parent
+ * card via `onDraftChange`; the card holds all its rows' drafts and submits them
+ * together with one button (so the re-score sees several new answers at once). The
+ * answered branch (the settled, read-only rendering) is unchanged.
  */
 
-import { useState } from "react"
-import { Check, CircleCheck, LoaderCircle } from "lucide-react"
+import { CircleCheck } from "lucide-react"
 
-import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import type { ClinicalQuestion } from "@/types"
 
 interface QuestionRowProps {
   question: ClinicalQuestion
-  submitting: boolean
+  /** The current draft text for this row, owned by the parent card. */
+  draftValue: string
   /** True while ANY answer on the interview is in flight (re-scoring is global). */
   busy: boolean
-  onAnswer: (questionId: string, answerText: string) => void
+  onDraftChange: (questionId: string, value: string) => void
 }
 
 export function QuestionRow({
   question,
-  submitting,
+  draftValue,
   busy,
-  onAnswer,
+  onDraftChange,
 }: QuestionRowProps) {
-  const [value, setValue] = useState("")
-
   if (question.answered) {
     return (
       <div className="flex items-start gap-2 rounded-lg border border-border bg-secondary/60 px-3 py-2.5">
@@ -50,45 +49,22 @@ export function QuestionRow({
     )
   }
 
-  const canSubmit = value.trim().length > 0 && !busy
-
   return (
     <div className="rounded-lg border border-border bg-card px-3 py-2.5">
       <p className="text-sm font-medium text-foreground">{question.text}</p>
       <p className="mt-0.5 text-xs text-muted-foreground">
         {question.diagnostic_intent}
       </p>
-      <form
-        className="mt-2 flex items-center gap-2"
-        onSubmit={(e) => {
-          e.preventDefault()
-          if (canSubmit) onAnswer(question.id, value.trim())
-        }}
-      >
-        <Input
-          value={value}
-          onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-            setValue(e.target.value)
-          }
-          placeholder="Type the patient's answer…"
-          disabled={busy}
-          aria-label={`Answer for: ${question.text}`}
-          className="h-8"
-        />
-        <Button type="submit" size="sm" disabled={!canSubmit} className="cursor-pointer">
-          {submitting ? (
-            <>
-              <LoaderCircle className="animate-spin" />
-              Re-scoring
-            </>
-          ) : (
-            <>
-              <Check />
-              Submit
-            </>
-          )}
-        </Button>
-      </form>
+      <Input
+        value={draftValue}
+        onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+          onDraftChange(question.id, e.target.value)
+        }
+        placeholder="Type the patient's answer…"
+        disabled={busy}
+        aria-label={`Answer for: ${question.text}`}
+        className="mt-2 h-8"
+      />
     </div>
   )
 }

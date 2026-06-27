@@ -15,10 +15,14 @@ import type {
   ArmExpandResponse,
   ArmQuestionsEvent,
   ClinicalQuestion,
+  HistoryChecklist,
   TriageOutput,
 } from "@/types"
 
 export interface TriageStreamHandlers {
+  /** General-history checklist resolved (fires before `triage`) — render the General
+   *  History card immediately, above the arms. */
+  onHistory: (checklist: HistoryChecklist) => void
   /** All arms scored (questions still empty) — render score cards immediately. */
   onTriage: (triage: TriageOutput) => void
   /** One arm's questions landed (completion order). */
@@ -54,6 +58,10 @@ export function openTriageStream(
   const es = new EventSource(url)
   let completed = false
 
+  es.addEventListener("history", (ev) => {
+    handlers.onHistory(JSON.parse(ev.data) as HistoryChecklist)
+  })
+
   es.addEventListener("triage", (ev) => {
     handlers.onTriage(JSON.parse(ev.data) as TriageOutput)
   })
@@ -88,21 +96,20 @@ export function openTriageStream(
   return () => es.close()
 }
 
-/** POST /api/answer — record one answer and re-score. Throws Error(detail) on a
- *  non-2xx so callers can surface the backend's clean 400/404 message. */
-export async function submitAnswer(
+/** POST /api/answers — record a BATCH of answers from ONE card submission and
+ *  re-score once. Replaces the old per-question submitAnswer: a card-level submit
+ *  sends every newly-answered question together, costing one re-score (and letting the
+ *  Prioritization Agent reason over them jointly). A single answer is just a one-item
+ *  list. Throws Error(detail) on a non-2xx so callers can surface the backend's clean
+ *  400/404 message. */
+export async function submitAnswers(
   sessionId: string,
-  questionId: string,
-  answerText: string,
+  answers: { question_id: string; answer_text: string }[],
 ): Promise<AnswerResponse> {
-  const res = await fetch("/api/answer", {
+  const res = await fetch("/api/answers", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      session_id: sessionId,
-      question_id: questionId,
-      answer_text: answerText,
-    }),
+    body: JSON.stringify({ session_id: sessionId, answers }),
   })
 
   if (!res.ok) {

@@ -42,6 +42,21 @@ FRAMEWORK_MATCH_MODEL = "anthropic/claude-haiku-4.5"
 # not merely matching it.
 FRAMEWORK_GENERATION_MODEL = "anthropic/claude-opus-4.6"
 
+# Routing for the History Agent (backend/app/agents/history_agent.py), which runs
+# BEFORE the Framework Agent to resolve a general-history checklist by patient
+# population. Same two-tier split as the Framework Agent, for the same reasons.
+
+# Population classification runs on EVERY request from the free-text patient_context
+# and is a low-stakes judgment — same tier reasoning as FRAMEWORK_MATCH_MODEL and
+# TRIAGE_MODEL: cheap/fast, called frequently.
+HISTORY_CLASSIFICATION_MODEL = "anthropic/claude-haiku-4.5"
+
+# Called at most len(PatientCategory) times across the product's ENTIRE lifetime (once
+# per population category, then cached permanently), so every future patient in that
+# category inherits this one call's quality — same amortized-quality argument as
+# FRAMEWORK_GENERATION_MODEL. Route to the strongest available tier.
+HISTORY_GENERATION_MODEL = "anthropic/claude-opus-4.6"
+
 # CLAUDE.md Section 5/6: how many arms get questions auto-generated at initial
 # triage. History of this decision (don't re-litigate the earlier steps):
 #   1. Originally a score THRESHOLD (QUESTION_GENERATION_THRESHOLD = 0.4) — a

@@ -26,26 +26,7 @@ from typing import cast
 
 from app.config import PRIORITIZATION_MODEL
 from app.core.call_agent import call_agent
-from app.models import RescoreTrigger, TriageOutput
-
-
-def _find_answered_question_text(trigger: RescoreTrigger) -> str:
-    """Recover the text of the question that was just answered, from the full arm
-    state carried on the trigger. The trigger only stores the question *id*; giving
-    the model the actual question text (not just "id X was answered") is what lets it
-    reason about what the answer is responding to.
-    """
-    for arm in trigger.current_arms:
-        for question in arm.questions:
-            if question.id == trigger.question_id:
-                return question.text
-    # The orchestrator marks the question answered before building the trigger, so it
-    # should always be present. If it isn't, fail loud rather than re-score against a
-    # phantom answer with no context.
-    raise ValueError(
-        f"question_id '{trigger.question_id}' not found in the trigger's arm state — "
-        f"cannot re-score against an answer whose question is unknown."
-    )
+from app.models import HistoryAnswer, RescoreTrigger, TriageOutput
 
 
 def _build_system_prompt(red_flag_arm_names: set[str]) -> str:
@@ -54,16 +35,20 @@ def _build_system_prompt(red_flag_arm_names: set[str]) -> str:
 history-taking assistant. You assist history-taking; you do NOT diagnose, and the \
 clinician remains the decision-maker.
 
-The clinician has just recorded the patient's answer to one history-taking question. \
+The clinician has just recorded the patient's answer(s) to one or more history-taking \
+questions, all from the same card, submitted together. \
 Your job has TWO parts, done together in this single pass:
 
-1. RE-SCORE every diagnostic arm. Given the new answer, decide whether each arm has \
+1. RE-SCORE every diagnostic arm. Given the new answer(s), decide whether each arm has \
 become MORE or LESS likely for THIS specific patient, and update BOTH its \
-relevance_score (0 to 1) AND its reasoning together. The reasoning MUST reflect the \
-NEW evidence — say what the answer told you and how that moved the score. Do NOT \
-restate the old reasoning with a new number stapled on; a re-score that changes the \
-number but not the explanation has not done its job. If the answer genuinely doesn't \
-affect an arm, you may keep its score, but say briefly why it's unaffected.
+relevance_score (0 to 1) AND its reasoning together. Consider ALL of the new answers \
+TOGETHER when re-scoring each arm — they were collected as one batch and may interact \
+(e.g. two answers together may move a score further, or in a different direction, than \
+either one alone would). The reasoning MUST reflect the NEW evidence — say what the \
+answer(s) told you and how that moved the score. Do NOT restate the old reasoning with \
+a new number stapled on; a re-score that changes the number but not the explanation has \
+not done its job. If the new answers genuinely don't affect an arm, you may keep its \
+score, but say briefly why it's unaffected.
 
 2. RED-FLAG SAFETY CHECK. These arms are time-critical, can't-miss diagnoses: \
 {red_flags}. relevance_score means LIKELIHOOD, not danger — do NOT inflate a \
@@ -89,6 +74,17 @@ the score on this answer alone") and leave the score where it is. This is the sa
 honesty principle as the red-flag check above: surface the uncertainty rather than \
 papering over it with a confident number.
 
+GENERAL PATIENT HISTORY CONTEXT. Alongside the just-answered question, you may also be \
+given a list of the patient's GENERAL history answers gathered for this interview \
+(past medical history, medications, allergies, smoking/alcohol/substance use, family \
+history, baseline function). These are background facts about the patient, NOT scored \
+items and NOT tied to any one arm. Use them as additional context that can legitimately \
+raise or lower an arm's likelihood — e.g. a heavy smoking history raises cardiac, \
+vascular, and respiratory arms; an anticoagulant or bleeding history raises haemorrhagic \
+arms. When such a fact is relevant to an arm you move, say so in that arm's reasoning. \
+When the trigger for this re-score is itself a general-history answer, treat it the same \
+way: revise the arms whose likelihood that background fact changes.
+
 Hard rules:
 - Return EVERY arm you are given, each with its EXACT same name. Do not invent, \
 rename, merge, or drop any arm.
@@ -104,12 +100,26 @@ async def rescore_arms(
     trigger: RescoreTrigger,
     chief_complaint: str,
     red_flag_arm_names: set[str],
+    history_answers: list[HistoryAnswer],
 ) -> TriageOutput:
-    """Re-score every arm in light of one new answer, and apply the red-flag check.
+    """Re-score every arm in light of a BATCH of new answers, and apply the red-flag
+    check.
 
     Returns a `TriageOutput` — the SAME contract shape as initial triage, because a
     re-score is the same kind of object (a snapshot of current arm state), just
     revised. No new output type is invented for this.
+
+    The just-answered questions come from `trigger.new_answers`, each of which already
+    carries its own `question_text` (resolved upstream by the caller, which is the one
+    place that can resolve text for BOTH arm questions and general-history questions —
+    the latter don't live in `current_arms`). So this function does NOT re-resolve text
+    from the arm state; it renders the batch directly. A single-answer submit is just a
+    one-element batch.
+
+    `history_answers` is the full set of general-history answers collected so far this
+    session (possibly empty). It is rendered as plain question/answer context so the
+    Prioritization Agent can weigh patient background — the SAME single agent call,
+    just with one extra context block (one loop, not two pipelines).
 
     The model is asked only to revise scores + reasoning (and to emit empty question
     lists). We then merge those revisions back onto the arms the trigger carried,
@@ -119,21 +129,43 @@ async def rescore_arms(
     how the orchestrator computes ScoreTransitions in code rather than asking the
     model to self-report what changed.
     """
-    answered_text = _find_answered_question_text(trigger)
-
     arm_lines = "\n".join(
         f"- {arm.name} | current score {arm.relevance_score:.2f} | {arm.reasoning}"
         for arm in trigger.current_arms
     )
+
+    # The batch of newly-answered questions, one line each. Plural by design: a
+    # card-level submit can carry several, and the prompt asks the model to weigh them
+    # jointly. A one-element batch renders as a single line — identical in spirit to the
+    # old single-answer block.
+    qa_lines = "\n".join(
+        f'  - Question: "{a.question_text}"  ->  Answer: "{a.answer_text}"'
+        for a in trigger.new_answers
+    )
+
+    # Render the general-history context block only when there ARE history answers, so
+    # an arm-triggered re-score with no history yet produces a prompt close to the
+    # pre-history behavior (keeping the verified arm-only behavior unchanged).
+    history_block = ""
+    if history_answers:
+        history_lines = "\n".join(
+            f'  - Q: "{h.question_text}"  A: "{h.answer_text}"'
+            for h in history_answers
+        )
+        history_block = (
+            f"General history collected for this patient so far:\n{history_lines}\n\n"
+        )
+
     system_prompt = _build_system_prompt(red_flag_arm_names)
     user_prompt = (
         f"Chief complaint: {chief_complaint}\n\n"
-        f"The patient has just answered this question:\n"
-        f'  Question: "{answered_text}"\n'
-        f'  Answer:   "{trigger.answer_text}"\n\n'
+        f"The clinician has just recorded these answer(s), submitted together:\n"
+        f"{qa_lines}\n\n"
+        f"{history_block}"
         f"Current state of every diagnostic arm:\n{arm_lines}\n\n"
-        f"Re-score every arm in light of this new answer, update each arm's reasoning "
-        f"to reflect it, and apply the red-flag safety check."
+        f"Re-score every arm in light of these new answers TOGETHER (and the general "
+        f"history above, if any), update each arm's reasoning to reflect them, and "
+        f"apply the red-flag safety check."
     )
 
     result = await call_agent(

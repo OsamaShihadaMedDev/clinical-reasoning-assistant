@@ -13,9 +13,12 @@
  * is purely presentational — the leader auto-expand logic lives in useInterview.
  */
 
+import { useState } from "react"
 import {
   Activity,
+  Check,
   CircleDashed,
+  LoaderCircle,
   Sparkles,
   TriangleAlert,
 } from "lucide-react"
@@ -26,6 +29,7 @@ import {
   AccordionTrigger,
 } from "@/components/ui/accordion"
 import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { QuestionRow } from "@/components/QuestionRow"
 import { ScoreGauge } from "@/components/ScoreGauge"
@@ -49,9 +53,16 @@ interface DiagnosticArmCardProps {
   /** This specific arm's questions are being lazily generated on demand because the
    *  user just expanded an arm the top-N fan-out skipped (show skeletons for it). */
   expanding: boolean
-  answeringId: string | null
+  /** This card's batch submit is currently in flight (drives the submit button's
+   *  loading state). */
+  submitting: boolean
   busy: boolean
-  onAnswer: (questionId: string, answerText: string) => void
+  /** Submit every drafted answer in this card together; returns whether it succeeded
+   *  (so the card can clear the submitted drafts). */
+  onAnswerBatch: (
+    cardId: string,
+    answers: { question_id: string; answer_text: string }[],
+  ) => Promise<boolean>
 }
 
 export function DiagnosticArmCard({
@@ -60,10 +71,14 @@ export function DiagnosticArmCard({
   transition,
   generating,
   expanding,
-  answeringId,
+  submitting,
   busy,
-  onAnswer,
+  onAnswerBatch,
 }: DiagnosticArmCardProps) {
+  // Drafts for this card's currently-unanswered questions: questionId -> text. Lives
+  // here (not per row) so the single card-level submit can see across all rows.
+  const [drafts, setDrafts] = useState<Record<string, string>>({})
+
   const flagged = isRedFlagged(arm.reasoning)
   const deprioritized = arm.status === "deprioritized"
   const awaitingQuestions = arm.questions.length === 0
@@ -72,6 +87,33 @@ export function DiagnosticArmCard({
   // (`expanding`).
   const showSkeletons =
     awaitingQuestions && !deprioritized && (generating || expanding)
+
+  // The drafts with real (non-empty) text, ready to submit. A clinician may fill only
+  // some rows, so empty/untouched ones are skipped.
+  const pendingAnswers = Object.entries(drafts)
+    .map(([question_id, value]) => ({ question_id, answer_text: value.trim() }))
+    .filter((a) => a.answer_text.length > 0)
+  const hasUnanswered = arm.questions.some((q) => !q.answered)
+  const canSubmit = pendingAnswers.length > 0 && !busy
+
+  function handleDraftChange(questionId: string, value: string) {
+    setDrafts((d) => ({ ...d, [questionId]: value }))
+  }
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault()
+    if (!canSubmit) return
+    const submitted = pendingAnswers
+    const ok = await onAnswerBatch(arm.name, submitted)
+    if (ok) {
+      // Clear only the drafts we actually submitted, leaving any half-typed rows alone.
+      setDrafts((d) => {
+        const next = { ...d }
+        for (const a of submitted) delete next[a.question_id]
+        return next
+      })
+    }
+  }
 
   return (
     <AccordionItem
@@ -152,17 +194,39 @@ export function DiagnosticArmCard({
             No questions generated for this arm.
           </p>
         ) : (
-          <div className="space-y-2">
+          <form onSubmit={handleSubmit} className="space-y-2">
             {arm.questions.map((q) => (
               <QuestionRow
                 key={q.id}
                 question={q}
-                submitting={answeringId === q.id}
+                draftValue={drafts[q.id] ?? ""}
                 busy={busy}
-                onAnswer={onAnswer}
+                onDraftChange={handleDraftChange}
               />
             ))}
-          </div>
+            {hasUnanswered && (
+              <div className="flex justify-end pt-0.5">
+                <Button
+                  type="submit"
+                  size="sm"
+                  disabled={!canSubmit}
+                  className="cursor-pointer"
+                >
+                  {submitting ? (
+                    <>
+                      <LoaderCircle className="animate-spin" />
+                      Re-scoring
+                    </>
+                  ) : (
+                    <>
+                      <Check />
+                      Submit answers
+                    </>
+                  )}
+                </Button>
+              </div>
+            )}
+          </form>
         )}
       </AccordionContent>
     </AccordionItem>
