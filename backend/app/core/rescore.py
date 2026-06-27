@@ -87,67 +87,56 @@ async def build_suggestions(
     )
 
 
-async def process_answers(
+def validate_answer_ids(
     answers: list[tuple[str, str]],
     current_triage: TriageOutput,
-    patient_context: str,
-    framework: Framework,
-    history_checklist: HistoryChecklist | None = None,
-    history_answers: list[HistoryAnswer] | None = None,
-) -> tuple[TriageOutput, list[ScoreTransition], SuggestionBatch]:
-    """Apply a BATCH of answered questions to the interview and re-score ONCE.
+    history_checklist: HistoryChecklist | None,
+) -> None:
+    """Read-only pre-flight: confirm EVERY answer's question_id resolves (an arm question
+    in the triage, or a history question in the checklist). Raises ValueError on the
+    first miss.
 
-    This is the card-level-submit version: a clinician fills several fields in one card
-    and submits them together, so a whole card costs exactly ONE Prioritization call
-    regardless of how many questions were answered. A single-answer submit is just the
-    one-element batch (`len(answers) == 1`) — no special-casing.
-
-    Returns the updated `TriageOutput`, the `ScoreTransition` records for arms whose
-    score actually moved (what the Trace Viewer renders), AND a freshly-ranked
-    `SuggestionBatch` (the clinician-facing "what to ask next" pool, recomputed over the
-    FINAL merged state so it reflects the just-applied answers and the promoted arms).
-
-    ONE re-score path, TWO input shapes per item. Each answered question is EITHER an
-    arm question OR a general-history question; we tell them apart by the id alone
-    (`is_history_question_id`) and branch ONLY on how each item is recorded — there is
-    still exactly one Prioritization call for the whole batch:
-      - ARM answer:     mark the ClinicalQuestion answered in place (as before).
-      - HISTORY answer: record a HistoryAnswer into `history_answers` (the session's
-                        accumulating list). Not part of any arm, so nothing in
-                        `current_triage` is mutated for it.
-    Every item is also added to the trigger's `new_answers` batch (each carrying its
-    resolved question_text), and the full `history_answers` list is always handed to
-    rescore_arms as background context.
-
-    `patient_context` is threaded through because a re-score can change WHICH arms are
-    in the auto-generated top N: if the batch lifts a previously-quiet arm into the top
-    N, we generate its questions here (using the same patient context the initial
-    fan-out used) so the caller gets one fully-consistent state.
-
-    `framework` is this session's resolved diagnostic-arm framework, used to derive the
-    red-flag (can't-miss) arm names per session (see the DATA-SOURCE CHANGE note above).
-
-    `history_checklist` / `history_answers` are this session's general-history state;
-    they default to None/[] so non-history callers (e.g. the terminal pipeline runner)
-    can ignore them. NOTE: history answers in the batch are appended to the SAME
-    `history_answers` list object the caller passed, so the caller's session reflects
-    them without a separate return value.
+    The streaming /api/answers route calls this BEFORE opening the event stream, so a
+    bad question_id is rejected with a synchronous HTTP 400 rather than a mid-stream
+    `error` frame — mirroring how the missing-session 404 stays a normal HTTP error.
+    Pure and side-effect-free (it does not mark anything answered).
     """
-    if history_answers is None:
-        history_answers = []
+    for question_id, _ in answers:
+        if is_history_question_id(question_id):
+            _find_history_question_text(history_checklist, question_id)  # raises if absent
+        elif _find_question(current_triage, question_id) is None:
+            raise ValueError(
+                f"question_id '{question_id}' not found in the current triage state."
+            )
 
-    # Per-session red-flag set: the time-critical arms the Prioritization Agent's
-    # safety check must never let silently sink. Derived from THIS session's framework.
+
+async def apply_batch_and_rescore(
+    answers: list[tuple[str, str]],
+    current_triage: TriageOutput,
+    framework: Framework,
+    history_checklist: HistoryChecklist | None,
+    history_answers: list[HistoryAnswer],
+) -> tuple[TriageOutput, list[ScoreTransition]]:
+    """Record a batch of answers and run the SINGLE re-score (the old steps 1-4).
+
+    Factored out of `process_answers` so the streaming endpoint can emit a `rescored`
+    stage event right after this returns — before suggestions are ranked — without
+    duplicating any logic. Mutates in place exactly as before: arm questions are marked
+    answered on `current_triage`, and history answers in the batch are appended to
+    `history_answers` (the session's running list). `history_answers` must be a real
+    list (the caller defaults it).
+
+    Each AnsweredQuestion carries its resolved question_text so rescore_arms never has to
+    re-resolve it (history questions aren't in the arm state). trigger_answer on each
+    ScoreTransition holds the whole batch joined into one string (keeps the field a plain
+    str so the Trace Viewer renders unchanged; a single-answer submit has no per-answer
+    attribution to lose anyway).
+    """
     red_flag_arm_names = {arm.name for arm in framework.arms if arm.red_flag}
 
-    # 1. Record EVERY answer in the batch, branching by TYPE, and assemble the trigger
-    #    batch. Each AnsweredQuestion carries its resolved question_text so rescore_arms
-    #    never has to re-resolve it (history questions aren't in the arm state).
     new_answers: list[AnsweredQuestion] = []
     for question_id, answer_text in answers:
         if is_history_question_id(question_id):
-            # General-history answer: not in any arm. Capture it as a HistoryAnswer and
-            # add it to the session's running list (also handed to rescore_arms below).
             question_text = _find_history_question_text(history_checklist, question_id)
             history_answers.append(
                 HistoryAnswer(
@@ -157,9 +146,6 @@ async def process_answers(
                 )
             )
         else:
-            # Arm answer: mark the ClinicalQuestion answered in place, so the answered
-            # flag/text travel with the arm and survive the re-score (which preserves
-            # questions).
             question = _find_question(current_triage, question_id)
             if question is None:
                 raise ValueError(
@@ -177,11 +163,7 @@ async def process_answers(
             )
         )
 
-    # 2. Build ONE trigger carrying the whole batch + the full current arm state.
     trigger = RescoreTrigger(new_answers=new_answers, current_arms=current_triage.arms)
-
-    # 3. Re-score ONCE for the whole batch. The agent reasons over all new answers
-    #    jointly (see prioritization.py's batch instruction).
     updated_triage = await rescore_arms(
         trigger,
         chief_complaint=current_triage.chief_complaint,
@@ -189,13 +171,6 @@ async def process_answers(
         history_answers=history_answers,
     )
 
-    # 4. Compute ScoreTransitions IN CODE by diffing old vs new scores per arm name —
-    #    never trust the model to self-report what changed, since the delta is a fact we
-    #    can compute directly and verify. Only emit a transition for arms that actually
-    #    moved. trigger_answer holds the batch joined into one string (the simpler of
-    #    the two options considered — keeps ScoreTransition.trigger_answer a plain str,
-    #    so the Trace Viewer renders unchanged; the tradeoff is it loses the one
-    #    answer -> one move mapping, which a single-answer submit doesn't have anyway).
     batch_answer_text = "; ".join(a.answer_text for a in new_answers)
     old_scores = {arm.name: arm.relevance_score for arm in current_triage.arms}
     transitions = [
@@ -208,38 +183,67 @@ async def process_answers(
         for arm in updated_triage.arms
         if arm.name in old_scores and old_scores[arm.name] != arm.relevance_score
     ]
+    return updated_triage, transitions
 
-    # 5. Re-evaluate the auto-generate top N AFTER merging the new scores. The top N is
-    #    NOT fixed at initial triage — a re-score can promote a previously-quiet arm
-    #    into it (e.g. a pleuritic answer lifting Pulmonary Embolism above Cardiac). Any
-    #    arm that is newly in the top N AND still has no questions gets them generated
-    #    now, as part of THIS call, via the same `ensure_arm_questions` primitive the
-    #    on-demand endpoint uses — so the system-triggered and click-triggered paths
-    #    are one mechanism, not two. We compare membership by NAME (scores can tie, but
-    #    names are unique and stable). `ensure_arm_questions` mutates arms in place and
-    #    they belong to `updated_triage`, so the new questions land in the object we
-    #    return — the caller stays oblivious that generation happened here.
-    old_top = {arm.name for arm in _qualifying_arms(current_triage)}
-    new_top_arms = _qualifying_arms(updated_triage)
+
+async def promote_newly_qualified(
+    prev_triage: TriageOutput,
+    updated_triage: TriageOutput,
+    patient_context: str,
+) -> None:
+    """Old step 5: after a re-score, any arm NEWLY in the auto-generate top N that still
+    has no questions gets them generated now (mutates `updated_triage` arms in place).
+
+    Factored out so the streaming endpoint can run it AFTER emitting `rescored` and
+    BEFORE ranking suggestions — the suggestion pool must see the promoted arms'
+    questions. We compare top-N membership by NAME (scores can tie; names are stable)
+    between the pre-rescore state and the merged state.
+    """
+    old_top = {arm.name for arm in _qualifying_arms(prev_triage)}
     newly_promoted = [
         arm
-        for arm in new_top_arms
+        for arm in _qualifying_arms(updated_triage)
         if arm.name not in old_top and not arm.questions
     ]
     if newly_promoted:
         await asyncio.gather(
             *(
-                ensure_arm_questions(arm, current_triage.chief_complaint, patient_context)
+                ensure_arm_questions(arm, updated_triage.chief_complaint, patient_context)
                 for arm in newly_promoted
             )
         )
 
-    # 6. Rank the clinician-facing suggestion pool over the FINAL merged state — after
-    #    the re-score AND after any newly-promoted arm's questions exist, so those are
-    #    in the candidate pool too. The momentum (`transitions`) just computed is fed in
-    #    so the agent can weight arms that moved sharply.
+
+async def process_answers(
+    answers: list[tuple[str, str]],
+    current_triage: TriageOutput,
+    patient_context: str,
+    framework: Framework,
+    history_checklist: HistoryChecklist | None = None,
+    history_answers: list[HistoryAnswer] | None = None,
+) -> tuple[TriageOutput, list[ScoreTransition], SuggestionBatch]:
+    """Apply a BATCH of answers, re-score ONCE, and rank suggestions — the plain
+    (non-streaming) composition.
+
+    This is the card-level submit semantics: a whole card costs exactly one
+    Prioritization call regardless of how many questions were answered; a single-answer
+    submit is just a one-element batch. Returns the updated `TriageOutput`, the
+    `ScoreTransition` records, AND the re-ranked `SuggestionBatch`.
+
+    It now COMPOSES the three reusable steps (`apply_batch_and_rescore` ->
+    `promote_newly_qualified` -> `build_suggestions`) that the streaming /api/answers
+    endpoint drives one-by-one with stage events in between — so the streaming and
+    plain paths share identical logic and can't drift. The plain path is still used by
+    the single-answer /api/answer route and the terminal pipeline runner.
+    """
+    if history_answers is None:
+        history_answers = []
+
+    updated_triage, transitions = await apply_batch_and_rescore(
+        answers, current_triage, framework, history_checklist, history_answers
+    )
+    await promote_newly_qualified(current_triage, updated_triage, patient_context)
     suggestions = await build_suggestions(
         updated_triage, framework, history_checklist, history_answers, transitions
     )
-
     return updated_triage, transitions, suggestions

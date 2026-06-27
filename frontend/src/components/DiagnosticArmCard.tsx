@@ -34,14 +34,9 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { QuestionRow } from "@/components/QuestionRow"
 import { ScoreGauge } from "@/components/ScoreGauge"
 import { ScoreTransitionIndicator } from "@/components/ScoreTransitionIndicator"
+import { isRedFlagged } from "@/lib/clinical"
 import { cn } from "@/lib/utils"
 import type { DiagnosticArm, ScoreTransition } from "@/types"
-
-/** The prioritisation agent flags a can't-miss arm in its reasoning text rather
- *  than by inflating the score (CLAUDE.md Section 7); surface that tell. */
-function isRedFlagged(reasoning: string): boolean {
-  return /cannot be excluded|red flag|can't-miss|cant-miss/i.test(reasoning)
-}
 
 interface DiagnosticArmCardProps {
   arm: DiagnosticArm

@@ -26,11 +26,18 @@ from app.agents.framework_agent import resolve_framework
 from app.agents.history_agent import resolve_history_checklist
 from app.agents.triage import run_triage
 from app.core.orchestration import (
+    _active_arms,
     ensure_arm_questions,
     populate_questions,
     populate_questions_streaming,
 )
-from app.core.rescore import build_suggestions, process_answers
+from app.core.rescore import (
+    apply_batch_and_rescore,
+    build_suggestions,
+    process_answers,
+    promote_newly_qualified,
+    validate_answer_ids,
+)
 from app.models import (
     DiagnosticArm,
     Framework,
@@ -224,14 +231,15 @@ async def _triage_event_stream(
       2. `arm_questions` — one per qualifying arm, the moment that arm's questions land
                            (completion order, via populate_questions_streaming). Only
                            that arm's data is sent, not the whole triage object again.
-      3. `done`          — once after every arm has streamed: carries the session_id,
-                           and the now-fully-populated TriageOutput (plus the history
-                           checklist) is stored in _SESSIONS so /api/answer can re-score
-                           this same interview.
+      3. `suggestions`   — once after all arms stream: the ranked "what to ask next"
+                           pool over the fully-populated triage (no momentum yet).
+      4. `done`          — last: carries the session_id, and the now-fully-populated
+                           TriageOutput (plus the history checklist and suggestions) is
+                           stored in _SESSIONS so /api/answers can re-score this interview.
 
-    Any failure (history, framework, triage, or a question-generation call) is surfaced
-    as an `error` event with a JSON `detail`, then the stream ends — never an unhandled
-    exception silently killing the connection.
+    Any failure (history, framework, triage, a question-generation call, or suggestion
+    ranking) is surfaced as an `error` event with a JSON `detail`, then the stream ends —
+    never an unhandled exception silently killing the connection.
     """
     # Stage 0/1: resolve the general-history checklist, then the framework, then triage
     # scoring. All inside this try so ANY resolution failure surfaces as a clean SSE
@@ -262,13 +270,27 @@ async def _triage_event_stream(
         yield _sse("error", {"detail": f"Question generation failed: {exc}"})
         return
 
-    # Stage 3: persist the complete interview and hand back the session id.
+    # Stage 3: rank the initial suggestion pool over the fully-populated triage (no score
+    # momentum yet — nothing has moved). Emitted as its own `suggestions` event so the
+    # pool appears right after the arms, before `done`.
+    try:
+        suggestions = await build_suggestions(
+            triage, framework, history, history_answers=[], transitions=[]
+        )
+    except Exception as exc:  # noqa: BLE001 — same fail-loud-to-client contract
+        yield _sse("error", {"detail": f"Ranking suggestions failed: {exc}"})
+        return
+
+    yield _sse("suggestions", suggestions.model_dump())
+
+    # Stage 4: persist the complete interview and hand back the session id.
     session_id = uuid4().hex
     _SESSIONS[session_id] = _Session(
         triage=triage,
         patient_context=patient_context,
         framework=framework,
         history_checklist=history,
+        suggestions=suggestions,
     )
     yield _sse("done", {"session_id": session_id})
 
@@ -338,18 +360,111 @@ async def _apply_answers(
     return AnswerResponse(triage=updated, transitions=transitions, suggestions=suggestions)
 
 
-@app.post("/api/answers", response_model=AnswerResponse)
-async def answer_questions_batch(request: AnswerBatchRequest) -> AnswerResponse:
-    """Record one or more answers from a SINGLE card submission and re-score ONCE.
+async def _answer_event_stream(
+    session_id: str, answers: list[tuple[str, str]]
+) -> AsyncIterator[str]:
+    """SSE body for POST /api/answers: stream the re-score path as named STAGES so the
+    clinician sees what's happening, not a blank spinner.
 
-    This is the primary answer route the React frontend uses: a card-level submit sends
-    every newly-answered question in that card together, costing exactly one
-    Prioritization call regardless of how many were answered, and letting the agent
-    reason over them jointly. Answers may be arm questions or general-history questions
-    (process_answers routes each by its id)."""
-    return await _apply_answers(
-        request.session_id,
-        [(a.question_id, a.answer_text) for a in request.answers],
+    Emits, in order:
+      1. `rescoring`           — before the Prioritization call. Data: {"arm_count": N}.
+      2. `rescored`            — once re-scored + diffed. Data: {"transitions": [...]} so
+                                 the differential strip can update before suggestions land.
+      3. `ranking_suggestions` — before the Suggestion Agent. Data: {} (stage marker).
+      4. `done`                — last: the FULL AnswerResponse shape (triage, transitions,
+                                 suggestions), identical to the plain-JSON body, so the
+                                 client reuses its existing response handling on `done`.
+      5. `error`               — any mid-stream failure; data {"detail": ...}.
+
+    Session existence and question-id validity are checked SYNCHRONOUSLY by the route
+    before this generator runs (normal 404/400 HTTP errors), so only the agent calls
+    here can fail mid-stream — same per-stage fail-loud-to-client discipline as the
+    triage stream. It drives the SAME rescore steps `process_answers` composes, just
+    with stage events between them.
+    """
+    session = _SESSIONS[session_id]  # guaranteed present: the route validated it.
+    try:
+        yield _sse("rescoring", {"arm_count": len(_active_arms(session.triage))})
+
+        updated, transitions = await apply_batch_and_rescore(
+            answers,
+            session.triage,
+            session.framework,
+            session.history_checklist,
+            session.history_answers,
+        )
+        # Transitions out immediately so the differential strip moves before suggestions.
+        yield _sse("rescored", {"transitions": [t.model_dump() for t in transitions]})
+
+        # Generate questions for any arm the re-score promoted into the top N, so the
+        # suggestion pool can rank over them. (Doesn't change scores.)
+        await promote_newly_qualified(session.triage, updated, session.patient_context)
+
+        yield _sse("ranking_suggestions", {})
+        suggestions = await build_suggestions(
+            updated,
+            session.framework,
+            session.history_checklist,
+            session.history_answers,
+            transitions,
+        )
+    except Exception as exc:  # noqa: BLE001 — fail loud TO THE CLIENT, like the triage stream
+        yield _sse("error", {"detail": str(exc)})
+        return
+
+    # Persist the re-scored session (history_answers was mutated in place by
+    # apply_batch_and_rescore; re-store for clarity, with the fresh suggestions).
+    _SESSIONS[session_id] = _Session(
+        triage=updated,
+        patient_context=session.patient_context,
+        framework=session.framework,
+        history_checklist=session.history_checklist,
+        history_answers=session.history_answers,
+        suggestions=suggestions,
+    )
+    yield _sse(
+        "done",
+        {
+            "triage": updated.model_dump(),
+            "transitions": [t.model_dump() for t in transitions],
+            "suggestions": suggestions.model_dump(),
+        },
+    )
+
+
+@app.post("/api/answers")
+async def answer_questions_batch(request: AnswerBatchRequest) -> StreamingResponse:
+    """Record a card's answers and re-score, STREAMING the stages over SSE.
+
+    The primary answer route the React frontend uses. Unlike /api/triage/stream (a GET,
+    because EventSource can't send a body), this stays a POST and is consumed on the
+    client via fetch + ReadableStream — the answer batch needs a JSON body. The wire
+    format is identical (reuses `_sse`); only the transport differs.
+
+    Validation is synchronous and up front so it returns normal HTTP errors, not SSE
+    error frames: 404 if the session is gone, 400 if any question_id doesn't resolve.
+    Only the agent calls inside the stream can fail mid-flight (-> `error` frame). The
+    terminal `done` frame carries the same shape as the old AnswerResponse body."""
+    session = _SESSIONS.get(request.session_id)
+    if session is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No active session '{request.session_id}'. Start a new interview "
+                f"via POST /api/triage first (sessions are in-memory and reset when "
+                f"the server restarts)."
+            ),
+        )
+    answers = [(a.question_id, a.answer_text) for a in request.answers]
+    try:
+        validate_answer_ids(answers, session.triage, session.history_checklist)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return StreamingResponse(
+        _answer_event_stream(request.session_id, answers),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

@@ -16,6 +16,8 @@ import type {
   ArmQuestionsEvent,
   ClinicalQuestion,
   HistoryChecklist,
+  ScoreTransition,
+  SuggestionBatch,
   TriageOutput,
 } from "@/types"
 
@@ -27,7 +29,9 @@ export interface TriageStreamHandlers {
   onTriage: (triage: TriageOutput) => void
   /** One arm's questions landed (completion order). */
   onArmQuestions: (name: string, questions: ClinicalQuestion[]) => void
-  /** Stream finished; carries the session id for follow-up /api/answer calls. */
+  /** The ranked "what to ask next" pool (fires after all arms, before `done`). */
+  onSuggestions: (suggestions: SuggestionBatch) => void
+  /** Stream finished; carries the session id for follow-up /api/answers calls. */
   onDone: (sessionId: string) => void
   /** A server-sent `error` event, or the connection dropping before `done`. */
   onError: (detail: string) => void
@@ -71,6 +75,10 @@ export function openTriageStream(
     handlers.onArmQuestions(d.name, d.questions)
   })
 
+  es.addEventListener("suggestions", (ev) => {
+    handlers.onSuggestions(JSON.parse(ev.data) as SuggestionBatch)
+  })
+
   es.addEventListener("done", (ev) => {
     completed = true
     const { session_id } = JSON.parse(ev.data) as { session_id: string }
@@ -96,33 +104,119 @@ export function openTriageStream(
   return () => es.close()
 }
 
-/** POST /api/answers — record a BATCH of answers from ONE card submission and
- *  re-score once. Replaces the old per-question submitAnswer: a card-level submit
- *  sends every newly-answered question together, costing one re-score (and letting the
- *  Prioritization Agent reason over them jointly). A single answer is just a one-item
- *  list. Throws Error(detail) on a non-2xx so callers can surface the backend's clean
- *  400/404 message. */
-export async function submitAnswers(
+/**
+ * Pure SSE wire-format helpers (no network) so the answer stream's frame parsing is
+ * testable in isolation and shared, not re-implemented inline. The wire format matches
+ * the backend's `_sse()`: frames separated by a blank line (`\n\n`), each frame a
+ * `event: <name>` line and a `data: <json>` line.
+ */
+
+/** Split a buffer into COMPLETE frames plus the trailing remainder (which may be a
+ *  partial frame — a streamed read can fragment mid-frame, so the caller carries `rest`
+ *  forward and re-feeds it with the next chunk). */
+export function splitSSEFrames(buffer: string): { frames: string[]; rest: string } {
+  const parts = buffer.split("\n\n")
+  const rest = parts.pop() ?? "" // last piece is incomplete until the next `\n\n` arrives
+  return { frames: parts.filter((f) => f.trim().length > 0), rest }
+}
+
+/** Parse one raw frame's `event:`/`data:` lines into a typed pair. Unknown lines are
+ *  ignored; multiple `data:` lines join with newlines (SSE spec), though the backend
+ *  only ever emits one. Defaults to event "message" if none given. */
+export function parseSSEFrame(raw: string): { event: string; data: string } {
+  let event = "message"
+  const dataLines: string[] = []
+  for (const line of raw.split("\n")) {
+    if (line.startsWith("event:")) event = line.slice("event:".length).trim()
+    else if (line.startsWith("data:")) dataLines.push(line.slice("data:".length).trim())
+  }
+  return { event, data: dataLines.join("\n") }
+}
+
+export interface AnswerStreamHandlers {
+  /** Re-score started; `armCount` active arms are being weighed. */
+  onRescoring: (armCount: number) => void
+  /** Arms re-scored; transitions are ready (differential can update before suggestions). */
+  onRescored: (transitions: ScoreTransition[]) => void
+  /** Suggestion ranking started. */
+  onRankingSuggestions: () => void
+  /** Finished: the full AnswerResponse (same shape the old JSON body had). */
+  onDone: (response: AnswerResponse) => void
+  /** A pre-stream HTTP error (404/400) or a mid-stream `error` frame. */
+  onError: (detail: string) => void
+}
+
+/**
+ * POST /api/answers and consume its SSE stream. This is a POST (the batch needs a JSON
+ * body), which `EventSource` can't do — so we read the `fetch` response body as a stream
+ * and parse SSE frames manually with the helpers above. Stage events drive the staged
+ * status UI; the `done` frame carries the same payload the old plain-JSON response did.
+ *
+ * Resolves when the stream ends (it does not throw on a backend error — errors are
+ * delivered via `onError`, matching `openTriageStream`'s callback style).
+ */
+export async function streamAnswers(
   sessionId: string,
   answers: { question_id: string; answer_text: string }[],
-): Promise<AnswerResponse> {
+  handlers: AnswerStreamHandlers,
+): Promise<void> {
   const res = await fetch("/api/answers", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ session_id: sessionId, answers }),
   })
 
-  if (!res.ok) {
+  // Pre-stream HTTP errors (404 missing session, 400 bad question_id) arrive as a normal
+  // JSON error body, not an SSE frame — surface them the same way.
+  if (!res.ok || !res.body) {
     let detail = res.statusText
     try {
       detail = ((await res.json()) as { detail?: string }).detail || detail
     } catch {
       /* keep fallback */
     }
-    throw new Error(detail)
+    handlers.onError(detail)
+    return
   }
 
-  return (await res.json()) as AnswerResponse
+  const dispatch = ({ event, data }: { event: string; data: string }) => {
+    switch (event) {
+      case "rescoring":
+        handlers.onRescoring((JSON.parse(data) as { arm_count: number }).arm_count)
+        break
+      case "rescored":
+        handlers.onRescored(
+          (JSON.parse(data) as { transitions: ScoreTransition[] }).transitions,
+        )
+        break
+      case "ranking_suggestions":
+        handlers.onRankingSuggestions()
+        break
+      case "done":
+        handlers.onDone(JSON.parse(data) as AnswerResponse)
+        break
+      case "error":
+        handlers.onError(
+          (JSON.parse(data) as { detail?: string }).detail || "stream error",
+        )
+        break
+    }
+  }
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  for (;;) {
+    const { value, done } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const { frames, rest } = splitSSEFrames(buffer)
+    buffer = rest
+    for (const frame of frames) dispatch(parseSSEFrame(frame))
+  }
+  // Flush any final frame not terminated by a trailing blank line.
+  const leftover = buffer.trim()
+  if (leftover) dispatch(parseSSEFrame(leftover))
 }
 
 /** POST /api/arm/expand — lazily generate questions for ONE arm the top-N fan-out

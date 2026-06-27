@@ -1,52 +1,64 @@
 /**
  * useInterview — the single orchestration hook for one interview session.
  *
- * It owns everything the UI derives from the backend: the streamed TriageOutput,
- * the SSE progress status, the controlled accordion open-set, the accumulating
- * trace log, and the transient per-arm score-transition map. Components stay
- * presentational; this is where the agent loop's client-side state lives.
+ * It owns everything the UI derives from the backend: the streamed TriageOutput, the
+ * general-history checklist, the staged SSE status, the suggestion pool, the answered
+ * log, and the transient per-arm score-transition map. Components stay presentational;
+ * this is where the agent loop's client-side state lives.
  *
- * The one piece of genuinely tricky behaviour here is the LEADER auto-expand
- * (CLAUDE.md 6b demo behaviour): see the leadership effect and computeLeader.
+ * Two streams feed it, both SSE but different transports:
+ *  - `openTriageStream` (GET EventSource) — initial interview: history -> arms ->
+ *    arm questions -> suggestions -> done.
+ *  - `streamAnswers` (POST fetch+ReadableStream) — each card submit: rescoring ->
+ *    rescored -> ranking_suggestions -> done. The staged events drive `status`.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
-import { expandArm as expandArmRequest, openTriageStream, submitAnswers } from "@/api/client"
+import { expandArm as expandArmRequest, openTriageStream, streamAnswers } from "@/api/client"
 import type {
   DiagnosticArm,
   HistoryChecklist,
   ScoreTransition,
+  SuggestionBatch,
   TriageOutput,
 } from "@/types"
 
-/** Card identity used for the General History card in `submittingArm` (arm cards use
- *  their arm name). A sentinel that can't collide with a real arm name. */
+/** Card identity used for the suggestion pool / General History card in `submittingArm`
+ *  (arm cards use their arm name). Sentinels that can't collide with a real arm name. */
 export const HISTORY_CARD_ID = "__history__"
+export const SUGGESTION_CARD_ID = "__suggestions__"
 
-/** Streaming status surfaced near the docked bar (drives StreamingStatus). */
+/** Streaming status surfaced near the docked bar (drives StreamingStatus). The
+ *  `rescoring` kind now carries the SSE stage so the UI can show distinct sub-labels
+ *  ("Re-scoring arms…" -> "Updating differential…" -> "Ranking next questions…"). */
 export type StreamStatus =
   | { kind: "idle" }
   | { kind: "scoring" }
   | { kind: "generating"; total: number; filled: number; current: string | null }
   | { kind: "ready" }
-  | { kind: "rescoring" }
+  | { kind: "rescoring"; stage: "rescoring" | "rescored" | "ranking_suggestions" }
   | { kind: "error"; detail: string }
 
-/** One answer's worth of trace, grouped like demo.html: the triggering answer
- *  plus the arms that moved because of it. Newest entries are prepended. */
-export interface TraceEntry {
+/** One answered question in the chronological log. Built PER answered question (a batch
+ *  of 3 makes 3 entries). The backend's ScoreTransition.trigger_answer is the whole
+ *  batch joined, so it can't attribute a specific move to a specific answer — we
+ *  therefore duplicate the batch's full `transitions` onto each entry of that batch
+ *  rather than invent a per-answer attribution the backend doesn't have. */
+export interface AnsweredLogEntry {
   id: number
-  answer: string
+  questionText: string
+  answerText: string
+  isHistoryQuestion: boolean
   transitions: ScoreTransition[]
+  timestamp: number
 }
 
 /**
  * Decide the current leader given the previous one.
  * - The leader is the arm with the highest relevance_score.
  * - A tie is NOT a leadership change: if the previous leader still shares the top
- *   score, it stays leader (so a score *decrease* that doesn't change who's on top,
- *   or another arm merely *tying* the top, does not fire the auto-expand).
+ *   score, it stays leader.
  * - Leadership only moves when some arm is STRICTLY above the previous leader.
  */
 function computeLeader(
@@ -67,23 +79,28 @@ function computeLeader(
 export function useInterview() {
   const [started, setStarted] = useState(false)
   const [triage, setTriage] = useState<TriageOutput | null>(null)
-  // General-history checklist (arrives on the SSE `history` event, before triage) and
-  // the locally-tracked answers to it. We track answeredHistory client-side because
-  // /api/answer returns only the re-scored arms+transitions, not the history state.
+  // General-history checklist (arrives on the SSE `history` event) and the locally-
+  // tracked answers to it (the answer stream returns only arms+transitions+suggestions,
+  // not history state, so we mark history answers client-side).
   const [historyChecklist, setHistoryChecklist] =
     useState<HistoryChecklist | null>(null)
   const [answeredHistory, setAnsweredHistory] = useState<Record<string, string>>({})
+  // The ranked "what to ask next" pool (SSE `suggestions` event at start; refreshed on
+  // every answer stream's `done`).
+  const [suggestions, setSuggestions] = useState<SuggestionBatch | null>(null)
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [status, setStatus] = useState<StreamStatus>({ kind: "idle" })
-  const [openArms, setOpenArms] = useState<string[]>([])
+  // Which arm's full question detail is expanded (tap a differential-strip card). A
+  // single selection replaces the old multi-open accordion set, since the strip is now
+  // the primary view and only one arm's full questions show at a time.
+  const [selectedArm, setSelectedArm] = useState<string | null>(null)
   const [leaderName, setLeaderName] = useState<string | null>(null)
-  const [traceLog, setTraceLog] = useState<TraceEntry[]>([])
+  const [answeredLog, setAnsweredLog] = useState<AnsweredLogEntry[]>([])
   const [recentTransitions, setRecentTransitions] = useState<
     Record<string, ScoreTransition>
   >({})
-  // Which card currently has a batch submit in flight (an arm name, or HISTORY_CARD_ID
-  // for the General History card). Replaces the old per-question answeringId — a
-  // card-level submit no longer maps to a single question id.
+  // Which card currently has a batch submit in flight (an arm name, HISTORY_CARD_ID, or
+  // SUGGESTION_CARD_ID) — drives that card's submit-button loading state.
   const [submittingArm, setSubmittingArm] = useState<string | null>(null)
   // Arm names whose questions are being lazily generated on demand (top-N fan-out
   // skipped them; the user just expanded one). Drives a per-arm loading skeleton.
@@ -91,32 +108,21 @@ export function useInterview() {
 
   const cleanupRef = useRef<(() => void) | null>(null)
   const prevLeaderRef = useRef<string | null>(null)
-  const traceIdRef = useRef(0)
+  const logIdRef = useRef(0)
 
-  // Arms in priority order (highest score first). Memoised on `triage` so the
-  // leadership effect below only re-runs when the triage object actually changes,
-  // not on every render.
+  // Arms in priority order (highest score first).
   const arms = useMemo(() => {
     if (!triage) return [] as DiagnosticArm[]
     return [...triage.arms].sort((a, b) => b.relevance_score - a.relevance_score)
   }, [triage])
 
-  // Leader auto-expand/collapse. This is data-driven, not click-driven, so it lives
-  // here (diffing previous vs current leader) rather than inside the Accordion's own
-  // open/close handler. On an actual leadership change it touches ONLY two arms —
-  // collapse the old leader, expand the new one — and never re-asserts itself
-  // between changes, so the user's manual toggles on every other arm are preserved.
+  // Track the leader (for the differential strip's "Leading" highlight). Data-driven
+  // and tie-stable via computeLeader. It no longer auto-expands anything — the arm
+  // detail is user-driven now (tap a strip card) — it only marks the top card.
   useEffect(() => {
     if (arms.length === 0) return
-    const prev = prevLeaderRef.current
-    const next = computeLeader(arms, prev)
-    if (next === prev) return
-
-    setOpenArms((open) => {
-      const updated = prev ? open.filter((n) => n !== prev) : [...open]
-      if (next && !updated.includes(next)) updated.push(next)
-      return updated
-    })
+    const next = computeLeader(arms, prevLeaderRef.current)
+    if (next === prevLeaderRef.current) return
     prevLeaderRef.current = next
     setLeaderName(next)
   }, [arms])
@@ -129,10 +135,11 @@ export function useInterview() {
       setTriage(null)
       setHistoryChecklist(null)
       setAnsweredHistory({})
+      setSuggestions(null)
       setSessionId(null)
-      setOpenArms([])
+      setSelectedArm(null)
       setLeaderName(null)
-      setTraceLog([])
+      setAnsweredLog([])
       setRecentTransitions({})
       prevLeaderRef.current = null
       setStatus({ kind: "scoring" })
@@ -161,6 +168,7 @@ export function useInterview() {
               : s,
           )
         },
+        onSuggestions: (s) => setSuggestions(s),
         onDone: (sid) => {
           setSessionId(sid)
           setStatus({ kind: "ready" })
@@ -171,76 +179,98 @@ export function useInterview() {
     [],
   )
 
-  // Submit a BATCH of answers from ONE card (arm card or General History card) and
-  // re-score once. `cardId` is the submitting card's identity (arm name, or
-  // HISTORY_CARD_ID) — only used to drive the card-level loading state. Returns whether
-  // the submit succeeded, so the card can clear exactly the drafts it submitted.
+  // Submit a BATCH of answers from ONE card (arm / history / suggestion pool) and
+  // re-score once, consuming the staged SSE stream. `cardId` drives the card-level
+  // loading state. Returns whether it succeeded, so the card can clear its drafts.
   const answerBatch = useCallback(
     async (
       cardId: string,
       answers: { question_id: string; answer_text: string }[],
     ): Promise<boolean> => {
       if (!sessionId || answers.length === 0) return false
+
+      // Resolve each answered question's text + type NOW (before the stream replaces
+      // `triage`), so the answered-log entries read correctly. Suggestion-pool answers
+      // reference arm/history questions by the same ids, so this resolves them too.
+      const historyById = new Map(
+        (historyChecklist?.questions ?? []).map((q) => [q.id, q]),
+      )
+      const armQuestionById = new Map(
+        (triage?.arms ?? []).flatMap((arm) => arm.questions).map((q) => [q.id, q]),
+      )
+      const resolved = answers.map((a) => {
+        const hq = historyById.get(a.question_id)
+        if (hq) {
+          return { ...a, questionText: hq.question_text, isHistory: true }
+        }
+        const aq = armQuestionById.get(a.question_id)
+        return { ...a, questionText: aq?.text ?? a.question_id, isHistory: false }
+      })
+
       setSubmittingArm(cardId)
-      setStatus({ kind: "rescoring" })
-      try {
-        const res = await submitAnswers(sessionId, answers)
-        setTriage(res.triage)
+      setStatus({ kind: "rescoring", stage: "rescoring" })
 
-        // Record any general-history answers in this batch locally (the response
-        // carries only arms+transitions, not history state). Detected by membership in
-        // the checklist rather than an id prefix, so the frontend keeps no knowledge of
-        // the backend id format.
-        const historyIds = new Set(
-          historyChecklist?.questions.map((q) => q.id) ?? [],
-        )
-        const newlyAnswered: Record<string, string> = {}
-        for (const a of answers) {
-          if (historyIds.has(a.question_id)) newlyAnswered[a.question_id] = a.answer_text
-        }
-        if (Object.keys(newlyAnswered).length > 0) {
-          setAnsweredHistory((prev) => ({ ...prev, ...newlyAnswered }))
-        }
+      let ok = false
+      await streamAnswers(sessionId, answers, {
+        onRescoring: () => setStatus({ kind: "rescoring", stage: "rescoring" }),
+        onRescored: (transitions) => {
+          setStatus({ kind: "rescoring", stage: "rescored" })
+          // Update the differential strip's per-arm deltas as soon as scores move,
+          // before suggestions finish ranking.
+          const map: Record<string, ScoreTransition> = {}
+          for (const t of transitions) map[t.arm_name] = t
+          setRecentTransitions(map)
+        },
+        onRankingSuggestions: () =>
+          setStatus({ kind: "rescoring", stage: "ranking_suggestions" }),
+        onDone: (res) => {
+          setTriage(res.triage)
+          setSuggestions(res.suggestions)
 
-        // Transient per-arm old->new indicator. Replacing the whole map (rather than
-        // merging) means only arms that moved on THIS submit carry a fresh object,
-        // so each ScoreTransitionIndicator self-fades exactly once per change.
-        const map: Record<string, ScoreTransition> = {}
-        for (const t of res.transitions) map[t.arm_name] = t
-        setRecentTransitions(map)
+          // Mark any general-history answers in this batch (detected by checklist
+          // membership — no backend id-format knowledge here).
+          const newlyAnswered: Record<string, string> = {}
+          for (const r of resolved) {
+            if (r.isHistory) newlyAnswered[r.question_id] = r.answer_text
+          }
+          if (Object.keys(newlyAnswered).length > 0) {
+            setAnsweredHistory((prev) => ({ ...prev, ...newlyAnswered }))
+          }
 
-        // Trace log entry, newest first. The answer is the batch joined into one
-        // string, matching the backend's joined ScoreTransition.trigger_answer.
-        const joined = answers.map((a) => a.answer_text).join("; ")
-        traceIdRef.current += 1
-        setTraceLog((log) => [
-          { id: traceIdRef.current, answer: joined, transitions: res.transitions },
-          ...log,
-        ])
-        setStatus({ kind: "ready" })
-        return true
-      } catch (e) {
-        setStatus({ kind: "error", detail: (e as Error).message })
-        return false
-      } finally {
-        setSubmittingArm(null)
-      }
+          // One log entry per answered question, newest-first (continuity with the old
+          // TraceLogPanel ordering). The batch's full transitions are duplicated onto
+          // each entry — see AnsweredLogEntry's note on why per-answer attribution
+          // isn't available from the backend.
+          const now = Date.now()
+          const entries: AnsweredLogEntry[] = resolved.map((r) => {
+            logIdRef.current += 1
+            return {
+              id: logIdRef.current,
+              questionText: r.questionText,
+              answerText: r.answer_text,
+              isHistoryQuestion: r.isHistory,
+              transitions: res.transitions,
+              timestamp: now,
+            }
+          })
+          // Prepend reversed so that within one batch the first-answered reads on top.
+          setAnsweredLog((log) => [...entries.reverse(), ...log])
+
+          setStatus({ kind: "ready" })
+          ok = true
+        },
+        onError: (detail) => setStatus({ kind: "error", detail }),
+      })
+
+      setSubmittingArm(null)
+      return ok
     },
-    [sessionId, historyChecklist],
+    [sessionId, historyChecklist, triage],
   )
 
-  // Lazily generate questions for ONE arm the top-N fan-out skipped, the moment the
-  // user expands it. Mirrors the backend's idempotent /api/arm/expand: every guard
-  // here is also enforced server-side, so this is purely to avoid pointless requests:
-  //  - need a live session id (only set after the stream's `done` event);
-  //  - only when settled (`ready`) — during `generating` the SSE stream is already
-  //    filling the top-3, and during `rescoring` a promotion is auto-generated inside
-  //    the /api/answer call, so a manual expand then would race/duplicate;
-  //  - skip arms that already have questions (idempotent no-op anyway) or aren't
-  //    active, and don't fire twice for an arm already in flight.
-  // setExpandingArms runs synchronously in the same event as setOpenArms (App calls
-  // this right after it), so React batches them and the skeleton shows on the very
-  // next render — no "No questions" flash before the fetch starts.
+  // Lazily generate questions for ONE arm the top-N fan-out skipped, when the user
+  // expands it. Mirrors the backend's idempotent /api/arm/expand; the guards just avoid
+  // pointless requests (all are also enforced server-side).
   const expandArm = useCallback(
     async (armName: string) => {
       if (!sessionId) return
@@ -276,6 +306,15 @@ export function useInterview() {
     [sessionId, status, triage, expandingArms],
   )
 
+  // Toggle the expanded arm detail; lazily generate its questions if it has none.
+  const selectArm = useCallback(
+    (armName: string) => {
+      setSelectedArm((cur) => (cur === armName ? null : armName))
+      void expandArm(armName)
+    },
+    [expandArm],
+  )
+
   // Close the stream if the component unmounts mid-flight.
   useEffect(() => () => cleanupRef.current?.(), [])
 
@@ -285,12 +324,13 @@ export function useInterview() {
     arms,
     historyChecklist,
     answeredHistory,
+    suggestions,
     sessionId,
     status,
-    openArms,
-    setOpenArms,
+    selectedArm,
+    selectArm,
     leaderName,
-    traceLog,
+    answeredLog,
     recentTransitions,
     submittingArm,
     expandingArms,

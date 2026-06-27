@@ -1,16 +1,19 @@
 /**
- * TraceLogPanel — CLAUDE.md 6b's Agent Trace Viewer, now a real React component
- * (it replaces demo.html's hand-rendered trace log). It makes the feedback loop
- * visibly true: each answer that re-scores arms appends an entry showing the
- * triggering answer and every arm that moved (old → new, with the delta).
+ * AnsweredLog — the chronological record of every answered question and the score
+ * moves it caused. It REPLACES TraceLogPanel: same ScoreTransition delta rendering
+ * (sorted by magnitude, up/down arrow, brand/flag colour — carried over verbatim
+ * because it's correct), but keyed per ANSWERED QUESTION instead of per re-score batch,
+ * and now showing the question + answer text as a transcript, not just the trigger.
  *
- * Order matches demo.html: newest entry first; within an entry, biggest movers
- * first. It reads `ScoreTransition` records the backend already returns — no extra
- * backend state.
+ * Ordering: NEWEST-FIRST, deliberately kept from TraceLogPanel — the most recent answer's
+ * effect is what the clinician most wants to see, and it avoids a scroll-to-bottom on
+ * every submit. (The "transcript / append-at-bottom" alternative was considered and
+ * rejected for that reason.) The hook prepends new entries, so we render in order.
  */
 
-import { ArrowDownRight, ArrowUpRight, History } from "lucide-react"
+import { ArrowDownRight, ArrowUpRight, History, ListChecks } from "lucide-react"
 
+import { Badge } from "@/components/ui/badge"
 import {
   Card,
   CardContent,
@@ -19,24 +22,24 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import { cn } from "@/lib/utils"
-import type { TraceEntry } from "@/hooks/useInterview"
+import type { AnsweredLogEntry } from "@/hooks/useInterview"
 
-export function TraceLogPanel({ entries }: { entries: TraceEntry[] }) {
+export function AnsweredLog({ entries }: { entries: AnsweredLogEntry[] }) {
   return (
     <Card className="gap-3">
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
-          <History className="size-4 text-brand" />
-          Agent Trace Viewer
+          <ListChecks className="size-4 text-brand" />
+          Answered log
         </CardTitle>
         <CardDescription>
-          Every re-score the feedback loop has made this session.
+          Every question answered this session and the arm scores it moved.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
         {entries.length === 0 ? (
           <p className="text-sm text-muted-foreground">
-            Answer a question to see arm scores change here.
+            Answer a question to build the log — its effect on the differential shows here.
           </p>
         ) : (
           entries.map((entry) => (
@@ -44,16 +47,26 @@ export function TraceLogPanel({ entries }: { entries: TraceEntry[] }) {
               key={entry.id}
               className="rounded-lg border border-border bg-muted/40 p-3"
             >
-              <p className="mb-2 text-xs text-muted-foreground">
-                <span className="font-medium text-foreground">Answer: </span>
-                {entry.answer}
+              <p className="flex flex-wrap items-center gap-1.5 text-sm font-medium text-foreground">
+                {entry.questionText}
+                {entry.isHistoryQuestion && (
+                  <Badge variant="secondary" className="gap-1 font-normal">
+                    <History className="size-3" />
+                    History
+                  </Badge>
+                )}
               </p>
+              <p className="mt-1 text-sm text-secondary-foreground">
+                <span className="font-medium text-brand">Answer: </span>
+                {entry.answerText}
+              </p>
+
               {entry.transitions.length === 0 ? (
-                <p className="text-xs text-muted-foreground">
+                <p className="mt-2 text-xs text-muted-foreground">
                   No arm scores changed.
                 </p>
               ) : (
-                <ul className="space-y-1">
+                <ul className="mt-2 space-y-1">
                   {[...entry.transitions]
                     .sort(
                       (a, b) =>
