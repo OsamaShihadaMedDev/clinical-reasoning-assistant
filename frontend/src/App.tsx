@@ -1,20 +1,27 @@
 /**
  * App — wires the interview together. The ComplaintBar morphs hero → docked; once
- * started, the page stacks (single column): the DifferentialStrip (compact, all arms),
- * an inline full-question detail for whichever arm is tapped, the General History card,
- * the ranked SuggestionPool ("what to ask next"), and the AnsweredLog. All data comes
- * from the two SSE streams (triage + answer) — no mocks.
+ * started, the page is a three-zone differential workspace (single column, stacked):
+ *
+ *   1. ComplaintBar (hero ↔ docked)
+ *   2. SuggestionPool — the ranked "what to ask next" surface (inline answer + a new
+ *      "Expand full card" jump to the relevant arm/General History)
+ *   3. OpenArmsLane — up to 3 full arm cards the clinician is actively working
+ *   4. DifferentialGrid — the remaining arms as compact closed tiles; the full General
+ *      History card is pinned FIRST in this same area (option b: rendered here by App,
+ *      not threaded through the grid, to avoid prop-drilling its 5 props)
+ *   5. AnsweredLog — the chronological record (evolved Trace Viewer)
+ *
+ * All data comes from the two SSE streams (triage + answer) via useInterview — no mocks.
  */
 
-import { useState } from "react"
+import { useRef, useState } from "react"
 
 import { AnsweredLog } from "@/components/AnsweredLog"
 import { ComplaintBar } from "@/components/ComplaintBar"
-import { DiagnosticArmCard } from "@/components/DiagnosticArmCard"
-import { DifferentialStrip } from "@/components/DifferentialStrip"
+import { DifferentialGrid } from "@/components/DifferentialGrid"
 import { HistoryCard } from "@/components/HistoryCard"
+import { OpenArmsLane } from "@/components/OpenArmsLane"
 import { SuggestionPool } from "@/components/SuggestionPool"
-import { Accordion } from "@/components/ui/accordion"
 import { Skeleton } from "@/components/ui/skeleton"
 import {
   HISTORY_CARD_ID,
@@ -22,16 +29,20 @@ import {
   useInterview,
 } from "@/hooks/useInterview"
 
-/** Compact strip placeholder shown after submit but before the `triage` event lands. */
-function StripSkeleton() {
+/** Grid placeholder shown after submit but before the `triage` event lands — sized to the
+ *  closed-grid tiles so there's no shape jump when real arms arrive. */
+function GridSkeleton() {
   return (
-    <div className="flex gap-2 overflow-hidden" aria-label="Scoring diagnostic arms">
-      {[0, 1, 2, 3, 4].map((i) => (
+    <div
+      className="grid grid-cols-1 gap-2 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4"
+      aria-label="Scoring diagnostic arms"
+    >
+      {[0, 1, 2, 3].map((i) => (
         <div
           key={i}
-          className="flex w-40 shrink-0 flex-col items-center gap-2 rounded-xl border border-border bg-card px-3 py-3"
+          className="flex flex-col items-center gap-2 rounded-xl border border-border bg-card px-3 py-4"
         >
-          <Skeleton className="size-12 rounded-full" />
+          <Skeleton className="size-13 rounded-full" />
           <Skeleton className="h-3 w-20" />
           <Skeleton className="h-2 w-12" />
         </div>
@@ -43,6 +54,14 @@ function StripSkeleton() {
 export default function App() {
   const iv = useInterview()
   const [barHeight, setBarHeight] = useState(0)
+  // Pulse target for the lane: bumping `signal` for an arm makes its lane card scroll
+  // into view + flash. Used when "Expand full card" targets an arm (so an already-open
+  // arm doesn't feel like a silent no-op, and a newly-opened one scrolls into view).
+  const [pulse, setPulse] = useState<{ name: string | null; signal: number }>({
+    name: null,
+    signal: 0,
+  })
+  const historyRef = useRef<HTMLDivElement>(null)
 
   const busy =
     iv.status.kind === "scoring" ||
@@ -50,8 +69,20 @@ export default function App() {
     iv.status.kind === "rescoring"
   const generating = iv.status.kind === "generating"
 
-  // The arm whose full question detail is expanded inline below the strip.
-  const detailArm = iv.arms.find((a) => a.name === iv.selectedArm)
+  // From a suggestion's "Expand full card": open the arm (no-op if already open) and
+  // pulse it. Grid-tile taps go straight to iv.openArm (no pulse) — the arm was closed,
+  // so its new lane card is its own feedback.
+  function openArmFromSuggestion(armName: string) {
+    iv.openArm(armName)
+    setPulse((p) => ({ name: armName, signal: p.signal + 1 }))
+  }
+
+  // General History isn't lane-eligible (pinned in the differential area), so "expand"
+  // for a history suggestion means scroll it into view. It's never mobile-collapsed
+  // (HistoryCard has no collapse state), so scrolling is the whole action.
+  function openHistory() {
+    historyRef.current?.scrollIntoView({ behavior: "smooth", block: "center" })
+  }
 
   return (
     <div className="min-h-screen bg-background">
@@ -69,63 +100,59 @@ export default function App() {
       >
         {iv.started && (
           <>
-            {/* 1. Differential strip (or loading skeleton before arms arrive). */}
-            {iv.arms.length === 0 ? (
-              <StripSkeleton />
-            ) : (
-              <DifferentialStrip
-                arms={iv.arms}
-                recentTransitions={iv.recentTransitions}
-                leaderName={iv.leaderName}
-                selectedArm={iv.selectedArm}
-                onSelect={iv.selectArm}
-              />
-            )}
-
-            {/* 2. Inline detail: the tapped arm's FULL question list (all questions,
-                answered + unanswered), reusing DiagnosticArmCard in a one-item Accordion.
-                Collapsing it (via the card's trigger) clears the selection. */}
-            {detailArm && (
-              <Accordion
-                multiple
-                value={[detailArm.name]}
-                onValueChange={(value) => {
-                  if (!(value as string[]).includes(detailArm.name)) {
-                    iv.selectArm(detailArm.name) // toggles selection back off
-                  }
-                }}
-              >
-                <DiagnosticArmCard
-                  arm={detailArm}
-                  isLeader={detailArm.name === iv.leaderName}
-                  transition={iv.recentTransitions[detailArm.name]}
-                  generating={generating}
-                  expanding={iv.expandingArms.has(detailArm.name)}
-                  submitting={iv.submittingArm === detailArm.name}
-                  busy={busy}
-                  onAnswerBatch={iv.answerBatch}
-                />
-              </Accordion>
-            )}
-
-            {/* 3. General History card (unchanged surface). */}
-            {iv.historyChecklist && (
-              <HistoryCard
-                checklist={iv.historyChecklist}
-                answeredHistory={iv.answeredHistory}
-                submitting={iv.submittingArm === HISTORY_CARD_ID}
-                busy={busy}
-                onAnswerBatch={iv.answerBatch}
-              />
-            )}
-
-            {/* 4. Ranked suggestion pool — the primary "what to ask next" surface. */}
+            {/* 1. Ranked suggestion pool — the primary "what to ask next" surface. */}
             <SuggestionPool
               suggestions={iv.suggestions}
               busy={busy}
               submitting={iv.submittingArm === SUGGESTION_CARD_ID}
               onAnswerBatch={iv.answerBatch}
+              onOpenArm={openArmFromSuggestion}
+              onOpenHistory={openHistory}
             />
+
+            {/* 2. Open Cards Lane — the arms being actively worked (renders nothing when
+                empty). */}
+            <OpenArmsLane
+              openArms={iv.openArms}
+              arms={iv.arms}
+              leaderName={iv.leaderName}
+              recentTransitions={iv.recentTransitions}
+              generating={generating}
+              expandingArms={iv.expandingArms}
+              submittingArm={iv.submittingArm}
+              busy={busy}
+              onAnswerBatch={iv.answerBatch}
+              onClose={iv.closeArm}
+              pulse={pulse}
+            />
+
+            {/* 3. General History — pinned first in the differential area (see header
+                comment / option b). Wrapped so the suggestion "expand" can scroll to it. */}
+            {iv.historyChecklist && (
+              <div ref={historyRef}>
+                <HistoryCard
+                  checklist={iv.historyChecklist}
+                  answeredHistory={iv.answeredHistory}
+                  submitting={iv.submittingArm === HISTORY_CARD_ID}
+                  busy={busy}
+                  onAnswerBatch={iv.answerBatch}
+                />
+              </div>
+            )}
+
+            {/* 4. Closed Grid — the remaining (not-open) arms as compact tiles. */}
+            {iv.arms.length === 0 ? (
+              <GridSkeleton />
+            ) : (
+              <DifferentialGrid
+                arms={iv.arms}
+                openArms={iv.openArms}
+                recentTransitions={iv.recentTransitions}
+                suggestions={iv.suggestions}
+                leaderName={iv.leaderName}
+                onOpen={iv.openArm}
+              />
+            )}
 
             {/* 5. Answered log (full width, the evolved Trace Viewer). */}
             <AnsweredLog entries={iv.answeredLog} />

@@ -13,7 +13,14 @@
  */
 
 import { useState } from "react"
-import { Check, History, LoaderCircle, Sparkles, TriangleAlert } from "lucide-react"
+import {
+  Check,
+  History,
+  LoaderCircle,
+  Maximize2,
+  Sparkles,
+  TriangleAlert,
+} from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -37,6 +44,12 @@ interface SuggestionPoolProps {
     cardId: string,
     answers: { question_id: string; answer_text: string }[],
   ) => Promise<boolean>
+  /** Open a diagnostic arm's full card in the lane (the "Expand full card" action). */
+  onOpenArm: (armName: string) => void
+  /** Scroll the General History card into view — used for history suggestions, which
+   *  aren't lane-eligible (General History is pinned in the differential area, not in
+   *  openArms), so "expand" means reveal-in-place, not add-to-lane. */
+  onOpenHistory: () => void
 }
 
 export function SuggestionPool({
@@ -44,6 +57,8 @@ export function SuggestionPool({
   busy,
   submitting,
   onAnswerBatch,
+  onOpenArm,
+  onOpenHistory,
 }: SuggestionPoolProps) {
   const [openId, setOpenId] = useState<string | null>(null)
   const [draft, setDraft] = useState("")
@@ -98,6 +113,15 @@ export function SuggestionPool({
       setOpenId(null)
       setDraft("")
     }
+  }
+
+  // "Expand full card": history suggestions reveal the (pinned, not lane-eligible)
+  // General History card; arm suggestions open the arm's full card in the lane. A
+  // suggestion that serves multiple arms opens the FIRST source arm — an acceptable
+  // simplification, since the inline answer already covers all its arms at once.
+  function handleExpand(s: SuggestedQuestion) {
+    if (s.is_history_question) onOpenHistory()
+    else if (s.source_arms.length > 0) onOpenArm(s.source_arms[0])
   }
 
   return (
@@ -193,6 +217,21 @@ export function SuggestionPool({
                   </Button>
                 </form>
               )}
+
+              {/* Secondary action: jump to the full card. De-emphasised below sm (icon-
+                  only text-link) so the primary inline-answer above stays dominant; a
+                  bordered button at sm+. */}
+              <div className="flex justify-end border-t border-border/60 px-4 py-1.5">
+                <button
+                  type="button"
+                  onClick={() => handleExpand(s)}
+                  aria-label="Expand full card"
+                  className="inline-flex cursor-pointer items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-brand transition-colors hover:bg-accent sm:border sm:border-border"
+                >
+                  <Maximize2 className="size-3.5" />
+                  <span className="hidden sm:inline">Expand full card</span>
+                </button>
+              </div>
             </div>
           )
         })}

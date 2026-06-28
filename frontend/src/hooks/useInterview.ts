@@ -54,6 +54,24 @@ export interface AnsweredLogEntry {
   timestamp: number
 }
 
+/** How many arm cards the clinician can work at once in the Open Cards Lane. This is a
+ *  WORKFLOW cap (how many hypotheses a clinician holds in hand), not a screen-size
+ *  accommodation, so it is the SAME on mobile and desktop — it does not vary by
+ *  breakpoint. Opening past the cap evicts the oldest-opened arm (index 0). */
+export const MAX_OPEN_ARMS = 3
+
+/**
+ * Pure reducer for the open-arms list (extracted so the eviction invariants are unit-
+ * testable without React): append `armName` unless it is already open (no-op, preserving
+ * order and avoiding a duplicate), capping at MAX_OPEN_ARMS by evicting the oldest entry
+ * (index 0). The list is ordered oldest -> newest by when each arm was opened.
+ */
+export function addOpenArm(current: string[], armName: string): string[] {
+  if (current.includes(armName)) return current
+  const next = [...current, armName]
+  return next.length > MAX_OPEN_ARMS ? next.slice(1) : next
+}
+
 /**
  * Decide the current leader given the previous one.
  * - The leader is the arm with the highest relevance_score.
@@ -90,10 +108,11 @@ export function useInterview() {
   const [suggestions, setSuggestions] = useState<SuggestionBatch | null>(null)
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [status, setStatus] = useState<StreamStatus>({ kind: "idle" })
-  // Which arm's full question detail is expanded (tap a differential-strip card). A
-  // single selection replaces the old multi-open accordion set, since the strip is now
-  // the primary view and only one arm's full questions show at a time.
-  const [selectedArm, setSelectedArm] = useState<string | null>(null)
+  // The arms whose FULL question card is open in the Open Cards Lane, ordered oldest ->
+  // newest by when each was opened (index 0 = oldest). Capped at MAX_OPEN_ARMS; opening a
+  // (cap+1)-th arm evicts index 0. Replaces the old single `selectedArm` so the clinician
+  // can work up to three hypotheses side by side.
+  const [openArms, setOpenArms] = useState<string[]>([])
   const [leaderName, setLeaderName] = useState<string | null>(null)
   const [answeredLog, setAnsweredLog] = useState<AnsweredLogEntry[]>([])
   const [recentTransitions, setRecentTransitions] = useState<
@@ -137,7 +156,7 @@ export function useInterview() {
       setAnsweredHistory({})
       setSuggestions(null)
       setSessionId(null)
-      setSelectedArm(null)
+      setOpenArms([])
       setLeaderName(null)
       setAnsweredLog([])
       setRecentTransitions({})
@@ -306,14 +325,21 @@ export function useInterview() {
     [sessionId, status, triage, expandingArms],
   )
 
-  // Toggle the expanded arm detail; lazily generate its questions if it has none.
-  const selectArm = useCallback(
+  // Open an arm's full card in the lane: add it (capped, evicting the oldest) and lazily
+  // generate its questions if the top-N fan-out skipped it. A no-op if already open — the
+  // caller is responsible for scrolling/highlighting the existing lane card (App.tsx).
+  const openArm = useCallback(
     (armName: string) => {
-      setSelectedArm((cur) => (cur === armName ? null : armName))
-      void expandArm(armName)
+      setOpenArms((cur) => addOpenArm(cur, armName))
+      void expandArm(armName) // unchanged lazy question generation; idempotent server-side
     },
     [expandArm],
   )
+
+  // Close one arm's card, removing it from the lane (leaving the others as-is).
+  const closeArm = useCallback((armName: string) => {
+    setOpenArms((cur) => cur.filter((n) => n !== armName))
+  }, [])
 
   // Close the stream if the component unmounts mid-flight.
   useEffect(() => () => cleanupRef.current?.(), [])
@@ -327,8 +353,9 @@ export function useInterview() {
     suggestions,
     sessionId,
     status,
-    selectedArm,
-    selectArm,
+    openArms,
+    openArm,
+    closeArm,
     leaderName,
     answeredLog,
     recentTransitions,

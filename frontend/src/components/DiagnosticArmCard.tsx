@@ -1,33 +1,41 @@
 /**
- * DiagnosticArmCard — one diagnostic arm as a card-styled Accordion item.
+ * DiagnosticArmCard — one diagnostic arm's FULL detail card, the content of a slot in the
+ * Open Cards Lane.
  *
- * Collapsed: name, the circular ScoreGauge, a status indicator (active vs.
- * deprioritized — distinguished by icon + label, not colour alone), a "Leading"
- * badge for the current top arm, a red-flag badge when the prioritisation agent's
- * reasoning carries a can't-miss tell, and the transient old→new score indicator.
+ * It is no longer an Accordion item driven by a single-select toggle (that mechanism is
+ * gone): it is unconditionally-rendered content inside whichever lane slot it occupies,
+ * with an explicit close button in its header (calls `onClose`) in place of the old
+ * expand/collapse chevron. Open/closed now means "is this arm in the lane", owned by
+ * useInterview's openArms.
  *
- * Expanded: the score `reasoning`, then the arm's questions (or sized Skeletons
- * while that arm's `arm_questions` SSE event is still pending).
+ * Header: name, the circular ScoreGauge, a status indicator (active vs. deprioritized —
+ * icon + label, never colour alone), a "Leading" badge for the top arm, a red-flag badge
+ * when the prioritisation reasoning carries a can't-miss tell, the transient old->new
+ * score indicator, and the close button.
  *
- * Open/closed is controlled by the parent Accordion (by arm name); this component
- * is purely presentational — the leader auto-expand logic lives in useInterview.
+ * Body: the score `reasoning`, then the questions split into two visually distinct groups:
+ *  - UNANSWERED questions stay full-weight (rationale + full-size input) — they are the
+ *    only thing still asking for the clinician's action, so they keep full prominence and
+ *    render FIRST (immediately visible without scrolling past completed work).
+ *  - ANSWERED questions collapse to a single compact line each (question + answer, a small
+ *    reused CircleCheck, no rationale, no card chrome) and sit at the BOTTOM as a settled
+ *    record. (Order decision: actionable-first; see the two groups below.)
+ * While an arm's questions are still being generated (initial top-N SSE fan-out or
+ * on-demand lazy expand) it shows sized Skeletons instead.
  */
 
 import { useState } from "react"
 import {
   Activity,
   Check,
+  CircleCheck,
   CircleDashed,
   LoaderCircle,
   Sparkles,
   TriangleAlert,
+  X,
 } from "lucide-react"
 
-import {
-  AccordionContent,
-  AccordionItem,
-  AccordionTrigger,
-} from "@/components/ui/accordion"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
@@ -46,7 +54,7 @@ interface DiagnosticArmCardProps {
    *  active arms). */
   generating: boolean
   /** This specific arm's questions are being lazily generated on demand because the
-   *  user just expanded an arm the top-N fan-out skipped (show skeletons for it). */
+   *  user just opened an arm the top-N fan-out skipped (show skeletons for it). */
   expanding: boolean
   /** This card's batch submit is currently in flight (drives the submit button's
    *  loading state). */
@@ -58,6 +66,8 @@ interface DiagnosticArmCardProps {
     cardId: string,
     answers: { question_id: string; answer_text: string }[],
   ) => Promise<boolean>
+  /** Remove this arm from the lane (the header close affordance). */
+  onClose: (armName: string) => void
 }
 
 export function DiagnosticArmCard({
@@ -69,6 +79,7 @@ export function DiagnosticArmCard({
   submitting,
   busy,
   onAnswerBatch,
+  onClose,
 }: DiagnosticArmCardProps) {
   // Drafts for this card's currently-unanswered questions: questionId -> text. Lives
   // here (not per row) so the single card-level submit can see across all rows.
@@ -78,17 +89,21 @@ export function DiagnosticArmCard({
   const deprioritized = arm.status === "deprioritized"
   const awaitingQuestions = arm.questions.length === 0
   // Skeletons cover BOTH paths to questions: the initial top-N SSE fan-out
-  // (`generating`) and on-demand lazy generation after the user expands this arm
+  // (`generating`) and on-demand lazy generation after the user opens this arm
   // (`expanding`).
   const showSkeletons =
     awaitingQuestions && !deprioritized && (generating || expanding)
+
+  // Split answered vs. unanswered: unanswered keep full weight and lead; answered are
+  // compacted to a one-line record at the bottom.
+  const unanswered = arm.questions.filter((q) => !q.answered)
+  const answered = arm.questions.filter((q) => q.answered)
 
   // The drafts with real (non-empty) text, ready to submit. A clinician may fill only
   // some rows, so empty/untouched ones are skipped.
   const pendingAnswers = Object.entries(drafts)
     .map(([question_id, value]) => ({ question_id, answer_text: value.trim() }))
     .filter((a) => a.answer_text.length > 0)
-  const hasUnanswered = arm.questions.some((q) => !q.answered)
   const canSubmit = pendingAnswers.length > 0 && !busy
 
   function handleDraftChange(questionId: string, value: string) {
@@ -111,14 +126,15 @@ export function DiagnosticArmCard({
   }
 
   return (
-    <AccordionItem
-      value={arm.name}
+    <div
       className={cn(
-        "rounded-xl border border-border bg-card px-4 ring-1 ring-foreground/5 transition-opacity",
+        "rounded-xl border border-border bg-card px-4 py-3 ring-1 ring-foreground/5 transition-opacity",
         deprioritized && "opacity-60",
       )}
     >
-      <AccordionTrigger className="items-center gap-3 py-3 hover:no-underline">
+      {/* Header (ex-AccordionTrigger): same info, plus an explicit close button where the
+          expand/collapse chevron used to be. */}
+      <div className="flex items-center gap-3">
         <ScoreGauge value={arm.relevance_score} />
 
         <div className="flex min-w-0 flex-col items-start gap-1">
@@ -156,12 +172,21 @@ export function DiagnosticArmCard({
           </span>
         </div>
 
-        <span className="ml-auto mr-1 flex items-center">
+        <span className="ml-auto flex items-center gap-1.5">
           <ScoreTransitionIndicator transition={transition} />
+          <button
+            type="button"
+            onClick={() => onClose(arm.name)}
+            aria-label={`Close ${arm.name}`}
+            className="cursor-pointer rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          >
+            <X className="size-4" />
+          </button>
         </span>
-      </AccordionTrigger>
+      </div>
 
-      <AccordionContent className="space-y-3">
+      {/* Body. */}
+      <div className="mt-3 space-y-3">
         <p
           className={cn(
             "rounded-lg bg-muted/60 px-3 py-2 text-sm leading-relaxed",
@@ -189,41 +214,72 @@ export function DiagnosticArmCard({
             No questions generated for this arm.
           </p>
         ) : (
-          <form onSubmit={handleSubmit} className="space-y-2">
-            {arm.questions.map((q) => (
-              <QuestionRow
-                key={q.id}
-                question={q}
-                draftValue={drafts[q.id] ?? ""}
-                busy={busy}
-                onDraftChange={handleDraftChange}
-              />
-            ))}
-            {hasUnanswered && (
-              <div className="flex justify-end pt-0.5">
-                <Button
-                  type="submit"
-                  size="sm"
-                  disabled={!canSubmit}
-                  className="cursor-pointer"
-                >
-                  {submitting ? (
-                    <>
-                      <LoaderCircle className="animate-spin" />
-                      Re-scoring
-                    </>
-                  ) : (
-                    <>
-                      <Check />
-                      Submit answers
-                    </>
-                  )}
-                </Button>
+          <>
+            {/* Unanswered first — full weight, card-level batch submit. */}
+            {unanswered.length > 0 && (
+              <form onSubmit={handleSubmit} className="space-y-2">
+                {unanswered.map((q) => (
+                  <QuestionRow
+                    key={q.id}
+                    question={q}
+                    draftValue={drafts[q.id] ?? ""}
+                    busy={busy}
+                    onDraftChange={handleDraftChange}
+                  />
+                ))}
+                <div className="flex justify-end pt-0.5">
+                  <Button
+                    type="submit"
+                    size="sm"
+                    disabled={!canSubmit}
+                    className="cursor-pointer"
+                  >
+                    {submitting ? (
+                      <>
+                        <LoaderCircle className="animate-spin" />
+                        Re-scoring
+                      </>
+                    ) : (
+                      <>
+                        <Check />
+                        Submit answers
+                      </>
+                    )}
+                  </Button>
+                </div>
+              </form>
+            )}
+
+            {/* Answered last — compacted to one line each (no rationale, no input chrome),
+                a settled record reusing the same CircleCheck answered marker. */}
+            {answered.length > 0 && (
+              <div
+                className={cn(
+                  "space-y-1.5",
+                  unanswered.length > 0 && "border-t border-border pt-3",
+                )}
+              >
+                <p className="text-xs font-medium text-muted-foreground">
+                  Answered ({answered.length})
+                </p>
+                {answered.map((q) => (
+                  <div key={q.id} className="flex items-start gap-2 text-sm">
+                    <CircleCheck
+                      className="mt-0.5 size-3.5 shrink-0 text-brand"
+                      aria-hidden="true"
+                    />
+                    <p className="min-w-0">
+                      <span className="text-muted-foreground">{q.text}</span>
+                      <span className="text-muted-foreground"> — </span>
+                      <span className="font-medium text-foreground">{q.answer_text}</span>
+                    </p>
+                  </div>
+                ))}
               </div>
             )}
-          </form>
+          </>
         )}
-      </AccordionContent>
-    </AccordionItem>
+      </div>
+    </div>
   )
 }
