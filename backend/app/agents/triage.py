@@ -59,6 +59,8 @@ wall pain should get very different weightings.
 specific patient details that raised or lowered the score (e.g. "Age >50, smoker, \
 exertional radiating pain"). Keep it to a phrase or one sentence, not a paragraph.
 - Set status to "active" for every arm at this stage.
+- Set source to "discovered" for every arm (these arms come from the framework, not \
+the clinician). This is enforced in code regardless, but emit "discovered".
 - Set questions to an EMPTY LIST ([]) for every arm. You must NOT generate any \
 history-taking questions — that is a different agent's job. This is a hard \
 requirement: questions must be [] for all arms.
@@ -103,4 +105,13 @@ async def run_triage(
 
     # call_agent is generic over BaseModel; here the validated instance is concretely
     # a TriageOutput, so we narrow the type for callers and type-checkers.
-    return cast(TriageOutput, result)
+    triage = cast(TriageOutput, result)
+
+    # Provenance is authoritative in code, never trusted from the model: every arm the
+    # framework produces is "discovered" by definition (strict structured output forces
+    # the model to emit SOME value for the new required `source` field, so we overwrite
+    # it rather than relying on the model getting it right). Clinician-added arms only
+    # ever originate from the /api/arm/custom path, which sets source explicitly.
+    for arm in triage.arms:
+        arm.source = "discovered"
+    return triage

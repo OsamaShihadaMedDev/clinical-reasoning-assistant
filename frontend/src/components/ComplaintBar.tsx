@@ -16,6 +16,7 @@ import { Stethoscope } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
+import { GlobalRescoreButton } from "@/components/GlobalRescoreButton"
 import { StreamingStatus } from "@/components/StreamingStatus"
 import { cn } from "@/lib/utils"
 import type { StreamStatus } from "@/hooks/useInterview"
@@ -28,6 +29,11 @@ interface ComplaintBarProps {
   /** Reports the bar's measured height so the page can reserve top padding and
    *  never hide arm cards behind the fixed bar (whatever it wraps to). */
   onHeightChange?: (height: number) => void
+  /** Global "Re-score" control (anchored here, beside the status chip): pending draft
+   *  count across the page, its in-flight flag, and the submit-all handler. */
+  pendingDraftCount: number
+  rescoreSubmitting: boolean
+  onRescoreAll: () => void
 }
 
 export function ComplaintBar({
@@ -36,6 +42,9 @@ export function ComplaintBar({
   status,
   onStart,
   onHeightChange,
+  pendingDraftCount,
+  rescoreSubmitting,
+  onRescoreAll,
 }: ComplaintBarProps) {
   const [chiefComplaint, setChiefComplaint] = useState("chest pain")
   const [patientContext, setPatientContext] = useState(
@@ -162,7 +171,17 @@ export function ComplaintBar({
             </Button>
           </form>
 
-          {docked && <StreamingStatus status={status} className="mt-2" />}
+          {docked && (
+            <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+              <StreamingStatus status={status} />
+              <GlobalRescoreButton
+                pendingCount={pendingDraftCount}
+                submitting={rescoreSubmitting}
+                busy={busy}
+                onRescore={onRescoreAll}
+              />
+            </div>
+          )}
         </div>
       </div>
     </div>

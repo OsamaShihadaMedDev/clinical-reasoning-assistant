@@ -16,8 +16,15 @@
  * in the Trace Viewer exactly like an arm answer.
  */
 
-import { useState } from "react"
-import { Check, CircleCheck, ClipboardList, Info, LoaderCircle } from "lucide-react"
+import {
+  Check,
+  ChevronRight,
+  CircleCheck,
+  ClipboardList,
+  Info,
+  LoaderCircle,
+  X,
+} from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -48,6 +55,21 @@ interface HistoryCardProps {
     cardId: string,
     answers: { question_id: string; answer_text: string }[],
   ) => Promise<boolean>
+  /** Collapsed-by-default like every other "not currently being acted on" surface; the
+   *  state is OWNED BY App so a history-targeted suggestion's "Expand full card" can open
+   *  it directly (not just scroll to a still-collapsed tile). NOT lane-eligible and not
+   *  counted toward the 3-open-arms cap — its own independent expand state. */
+  expanded: boolean
+  onExpandedChange: (expanded: boolean) => void
+  /** Shared global draft store (keyed by question_id) and its writer — this card reads/
+   *  writes its own questions' drafts here so the global Re-score control can see them. */
+  drafts: Record<string, string>
+  onDraftChange: (questionId: string, text: string) => void
+  /** Clear the given ids from the shared store (called on this card's own submit only). */
+  onClearDrafts: (ids: string[]) => void
+  /** Total non-empty pending drafts across the WHOLE page — used to detect whether any
+   *  draft exists OUTSIDE this card (count > this card's own pending) for the nudge text. */
+  pendingDraftCount: number
 }
 
 export function HistoryCard({
@@ -56,50 +78,97 @@ export function HistoryCard({
   submitting,
   busy,
   onAnswerBatch,
+  expanded,
+  onExpandedChange,
+  drafts,
+  onDraftChange,
+  onClearDrafts,
+  pendingDraftCount,
 }: HistoryCardProps) {
-  // Drafts for the currently-unanswered questions: questionId -> text.
-  const [drafts, setDrafts] = useState<Record<string, string>>({})
-
   // The empty-context reasoning already tells the user to re-run; only append the
   // guidance when the reasoning doesn't already mention it, so it never duplicates.
   const mentionsRerun = /re-?run/i.test(checklist.category_reasoning)
 
-  const pendingAnswers = Object.entries(drafts)
-    .map(([question_id, value]) => ({ question_id, answer_text: value.trim() }))
+  // This card's own pending answers: its question ids with non-empty text in the SHARED
+  // store (scopes the per-card submit to just history).
+  const pendingAnswers = checklist.questions
+    .map((q) => ({ question_id: q.id, answer_text: (drafts[q.id] ?? "").trim() }))
     .filter((a) => a.answer_text.length > 0)
   const hasUnanswered = checklist.questions.some(
     (q) => answeredHistory[q.id] === undefined,
   )
   const canSubmit = pendingAnswers.length > 0 && !busy
+  const hasOtherPendingDrafts = pendingDraftCount > pendingAnswers.length
 
-  function handleDraftChange(questionId: string, value: string) {
-    setDrafts((d) => ({ ...d, [questionId]: value }))
-  }
+  const total = checklist.questions.length
+  const answeredCount = checklist.questions.filter(
+    (q) => answeredHistory[q.id] !== undefined,
+  ).length
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     if (!canSubmit) return
     const submitted = pendingAnswers
     const ok = await onAnswerBatch(HISTORY_CARD_ID, submitted)
-    if (ok) {
-      setDrafts((d) => {
-        const next = { ...d }
-        for (const a of submitted) delete next[a.question_id]
-        return next
-      })
-    }
+    // Clear only the ids we submitted — never any other card's pending drafts.
+    if (ok) onClearDrafts(submitted.map((a) => a.question_id))
+  }
+
+  // Collapsed by default — a compact pinned entry point consistent with the closed-grid
+  // tile language, so History doesn't read as a required permanent block. Clicking it
+  // expands in place. A progress count appears once anything is answered, so an engaged
+  // card looks different from an untouched one.
+  if (!expanded) {
+    return (
+      <button
+        type="button"
+        onClick={() => onExpandedChange(true)}
+        className="flex w-full items-center gap-3 rounded-xl border border-border bg-card px-4 py-3 text-left transition-transform duration-200 ease-out hover:-translate-y-0.5"
+      >
+        <ClipboardList className="size-5 shrink-0 text-brand" aria-hidden="true" />
+        <div className="min-w-0 flex-1">
+          <p className="flex flex-wrap items-center gap-2 font-heading text-sm font-medium text-foreground">
+            General history
+            <Badge variant="secondary" className="font-normal">
+              {CATEGORY_LABELS[checklist.category]}
+            </Badge>
+          </p>
+          <p className="text-xs text-muted-foreground">
+            {answeredCount > 0
+              ? `${answeredCount} of ${total} answered`
+              : "Fill in for more context"}
+          </p>
+        </div>
+        <ChevronRight className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+      </button>
+    )
   }
 
   return (
-    <Card className="mb-3 gap-3">
+    <Card className="gap-3">
       <CardHeader>
-        <CardTitle className="flex flex-wrap items-center gap-2">
-          <ClipboardList className="size-4 text-brand" />
-          General History
-          <Badge variant="secondary" className="font-normal">
-            {CATEGORY_LABELS[checklist.category]}
-          </Badge>
-        </CardTitle>
+        <div className="flex items-start justify-between gap-2">
+          <CardTitle className="flex flex-wrap items-center gap-2">
+            <ClipboardList className="size-4 text-brand" />
+            General History
+            <Badge variant="secondary" className="font-normal">
+              {CATEGORY_LABELS[checklist.category]}
+            </Badge>
+            {answeredCount > 0 && (
+              <span className="text-xs font-normal text-muted-foreground">
+                {answeredCount} of {total} answered
+              </span>
+            )}
+          </CardTitle>
+          <button
+            type="button"
+            onClick={() => onExpandedChange(false)}
+            aria-label="Collapse general history"
+            className="cursor-pointer rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          >
+            <X className="size-4" />
+          </button>
+        </div>
       </CardHeader>
 
       <CardContent className="space-y-2">
@@ -128,11 +197,16 @@ export function HistoryCard({
               answer={answeredHistory[q.id]}
               draftValue={drafts[q.id] ?? ""}
               busy={busy}
-              onDraftChange={handleDraftChange}
+              onDraftChange={onDraftChange}
             />
           ))}
           {hasUnanswered && (
-            <div className="flex justify-end pt-0.5">
+            <div className="flex items-center justify-end gap-2 pt-0.5">
+              {hasOtherPendingDrafts && (
+                <span className="mr-auto text-xs text-muted-foreground">
+                  Submits only this card's answers
+                </span>
+              )}
               <Button
                 type="submit"
                 size="sm"

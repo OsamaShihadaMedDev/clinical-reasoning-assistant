@@ -29,8 +29,32 @@ from app.core.call_agent import call_agent
 from app.models import HistoryAnswer, RescoreTrigger, TriageOutput
 
 
-def _build_system_prompt(red_flag_arm_names: set[str]) -> str:
+def _build_system_prompt(
+    red_flag_arm_names: set[str], newly_added_arm_names: set[str]
+) -> str:
     red_flags = ", ".join(sorted(red_flag_arm_names)) or "(none marked)"
+
+    # Only included when this re-score was triggered by the clinician ADDING arms (the
+    # /api/arm/custom path), following the same conditional-context style as the general-
+    # history block in rescore_arms. Empty string for the ordinary answer-driven re-score,
+    # so that path's prompt is unchanged.
+    newly_added_block = ""
+    if newly_added_arm_names:
+        added = ", ".join(sorted(newly_added_arm_names))
+        newly_added_block = f"""
+
+NEWLY ADDED ARMS. The clinician has just added these arms to the differential because \
+they suspected something the initial framework may have missed: {added}. These arms have \
+NO answered questions of their own yet and arrive carrying a PLACEHOLDER score you MUST \
+replace with a real one. Score each newly added arm honestly against everything already \
+known about THIS specific case — the chief complaint, the patient context, the general \
+history answers, and the evidence already gathered for the other arms where it overlaps — \
+exactly as you would an arm discovered at triage. Do NOT leave a newly added arm at a \
+default/middling score just because it is new, and do NOT inflate it just because the \
+clinician raised it. Because every arm (new and existing) is scored together in this one \
+pass, weigh the new arms against and alongside the existing differential, not in \
+isolation, and let them shift the existing arms' scores where that is warranted."""
+
     return f"""You are the Prioritization & Re-Scoring Agent in a clinical \
 history-taking assistant. You assist history-taking; you do NOT diagnose, and the \
 clinician remains the decision-maker.
@@ -83,7 +107,7 @@ raise or lower an arm's likelihood — e.g. a heavy smoking history raises cardi
 vascular, and respiratory arms; an anticoagulant or bleeding history raises haemorrhagic \
 arms. When such a fact is relevant to an arm you move, say so in that arm's reasoning. \
 When the trigger for this re-score is itself a general-history answer, treat it the same \
-way: revise the arms whose likelihood that background fact changes.
+way: revise the arms whose likelihood that background fact changes.{newly_added_block}
 
 Hard rules:
 - Return EVERY arm you are given, each with its EXACT same name. Do not invent, \
@@ -137,11 +161,40 @@ async def rescore_arms(
     # The batch of newly-answered questions, one line each. Plural by design: a
     # card-level submit can carry several, and the prompt asks the model to weigh them
     # jointly. A one-element batch renders as a single line — identical in spirit to the
-    # old single-answer block.
+    # old single-answer block. May be EMPTY when the re-score was triggered by added arms
+    # rather than new answers (the event block below switches framing in that case).
     qa_lines = "\n".join(
         f'  - Question: "{a.question_text}"  ->  Answer: "{a.answer_text}"'
         for a in trigger.new_answers
     )
+
+    # What kicked off this re-score: new answers (the usual case) OR newly added arms with
+    # no accompanying answers (the /api/arm/custom path). Keep the answer-driven wording
+    # byte-for-byte unchanged so that verified behavior is untouched; only the
+    # no-answers/added-arms case gets the alternate framing.
+    if trigger.new_answers:
+        event_block = (
+            "The clinician has just recorded these answer(s), submitted together:\n"
+            f"{qa_lines}\n\n"
+        )
+        instruction = (
+            "Re-score every arm in light of these new answers TOGETHER (and the general "
+            "history above, if any), update each arm's reasoning to reflect them, and "
+            "apply the red-flag safety check."
+        )
+    else:
+        added = ", ".join(trigger.newly_added_arm_names)
+        event_block = (
+            f"The clinician has just ADDED these arms to the differential: {added}. "
+            "No new patient answers accompany this change.\n\n"
+        )
+        instruction = (
+            "Re-score every arm — including the newly added ones — TOGETHER, accounting "
+            "for each other and everything already known (chief complaint, patient "
+            "context, general history). Replace each newly added arm's placeholder score "
+            "and reasoning with a real, case-specific one, and apply the red-flag safety "
+            "check."
+        )
 
     # Render the general-history context block only when there ARE history answers, so
     # an arm-triggered re-score with no history yet produces a prompt close to the
@@ -156,16 +209,15 @@ async def rescore_arms(
             f"General history collected for this patient so far:\n{history_lines}\n\n"
         )
 
-    system_prompt = _build_system_prompt(red_flag_arm_names)
+    system_prompt = _build_system_prompt(
+        red_flag_arm_names, set(trigger.newly_added_arm_names)
+    )
     user_prompt = (
         f"Chief complaint: {chief_complaint}\n\n"
-        f"The clinician has just recorded these answer(s), submitted together:\n"
-        f"{qa_lines}\n\n"
+        f"{event_block}"
         f"{history_block}"
         f"Current state of every diagnostic arm:\n{arm_lines}\n\n"
-        f"Re-score every arm in light of these new answers TOGETHER (and the general "
-        f"history above, if any), update each arm's reasoning to reflect them, and "
-        f"apply the red-flag safety check."
+        f"{instruction}"
     )
 
     result = await call_agent(

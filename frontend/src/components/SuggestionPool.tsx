@@ -20,6 +20,7 @@ import {
   Maximize2,
   Sparkles,
   TriangleAlert,
+  UserPlus,
 } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
@@ -50,6 +51,17 @@ interface SuggestionPoolProps {
    *  aren't lane-eligible (General History is pinned in the differential area, not in
    *  openArms), so "expand" means reveal-in-place, not add-to-lane. */
   onOpenHistory: () => void
+  /** Shared global draft store (keyed by question_id) and its writer. Each suggestion
+   *  mirrors an arm/history question by id, so its draft lives in the same store —
+   *  independent per id, which is what fixes the old single-`draft` overwrite bug. */
+  drafts: Record<string, string>
+  onDraftChange: (questionId: string, text: string) => void
+  /** Clear the given ids from the shared store (called on a suggestion's own submit). */
+  onClearDrafts: (ids: string[]) => void
+  /** Total non-empty pending drafts across the WHOLE page — drives the per-card nudge. */
+  pendingDraftCount: number
+  /** Names of clinician-added arms — marks a source-arm tag as "added by you". */
+  clinicianArmNames: Set<string>
 }
 
 export function SuggestionPool({
@@ -59,9 +71,16 @@ export function SuggestionPool({
   onAnswerBatch,
   onOpenArm,
   onOpenHistory,
+  drafts,
+  onDraftChange,
+  onClearDrafts,
+  pendingDraftCount,
+  clinicianArmNames,
 }: SuggestionPoolProps) {
-  const [openId, setOpenId] = useState<string | null>(null)
-  const [draft, setDraft] = useState("")
+  // A SET of open ids (not a single nullable id): multiple suggestion cards can show their
+  // input at once now that drafts are independently keyed by question_id — a clinician
+  // comparing two suggested questions side by side no longer wipes one by opening another.
+  const [openIds, setOpenIds] = useState<Set<string>>(new Set())
   const [showAll, setShowAll] = useState(false)
 
   const Header = (
@@ -103,15 +122,28 @@ export function SuggestionPool({
   const visible = showAll ? all : all.slice(0, POOL_FOLD)
   const hiddenCount = all.length - visible.length
 
+  function toggleOpen(questionId: string) {
+    setOpenIds((cur) => {
+      const next = new Set(cur)
+      if (next.has(questionId)) next.delete(questionId)
+      else next.add(questionId)
+      return next
+    })
+  }
+
   async function handleSubmit(s: SuggestedQuestion) {
-    const text = draft.trim()
+    const text = (drafts[s.question_id] ?? "").trim()
     if (!text || busy) return
     const ok = await onAnswerBatch(SUGGESTION_CARD_ID, [
       { question_id: s.question_id, answer_text: text },
     ])
     if (ok) {
-      setOpenId(null)
-      setDraft("")
+      onClearDrafts([s.question_id])
+      setOpenIds((cur) => {
+        const next = new Set(cur)
+        next.delete(s.question_id)
+        return next
+      })
     }
   }
 
@@ -129,7 +161,14 @@ export function SuggestionPool({
       {Header}
       <div className="space-y-2">
         {visible.map((s) => {
-          const open = openId === s.question_id
+          const draftText = drafts[s.question_id] ?? ""
+          // Show the input when explicitly opened OR whenever a draft already exists, so a
+          // typed-but-collapsed answer is never hidden from the clinician (it still counts
+          // toward the global Re-score either way).
+          const open = openIds.has(s.question_id) || draftText.length > 0
+          // This suggestion submits only its own one answer, so its "own pending" is 0/1.
+          const hasOtherPendingDrafts =
+            pendingDraftCount > (draftText.trim().length > 0 ? 1 : 0)
           return (
             <div
               key={s.question_id}
@@ -144,10 +183,7 @@ export function SuggestionPool({
 
               <button
                 type="button"
-                onClick={() => {
-                  setOpenId(open ? null : s.question_id)
-                  setDraft("")
-                }}
+                onClick={() => toggleOpen(s.question_id)}
                 aria-expanded={open}
                 className="block w-full px-4 py-3 text-left"
               >
@@ -171,7 +207,10 @@ export function SuggestionPool({
                     </Badge>
                   )}
                   {s.source_arms.map((arm) => (
-                    <Badge key={arm} variant="secondary" className="font-normal">
+                    <Badge key={arm} variant="secondary" className="gap-1 font-normal">
+                      {clinicianArmNames.has(arm) && (
+                        <UserPlus className="size-3" aria-label="Added by you" />
+                      )}
                       {arm}
                     </Badge>
                   ))}
@@ -180,41 +219,48 @@ export function SuggestionPool({
 
               {open && (
                 <form
-                  className="flex items-center gap-2 px-4 pb-3"
+                  className="px-4 pb-3"
                   onSubmit={(e) => {
                     e.preventDefault()
                     void handleSubmit(s)
                   }}
                 >
-                  <Input
-                    autoFocus
-                    value={draft}
-                    onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                      setDraft(e.target.value)
-                    }
-                    placeholder="Type the patient's answer…"
-                    disabled={busy}
-                    aria-label={`Answer for: ${s.question_text}`}
-                    className="h-8"
-                  />
-                  <Button
-                    type="submit"
-                    size="sm"
-                    disabled={draft.trim().length === 0 || busy}
-                    className="cursor-pointer"
-                  >
-                    {submitting ? (
-                      <>
-                        <LoaderCircle className="animate-spin" />
-                        Re-scoring
-                      </>
-                    ) : (
-                      <>
-                        <Check />
-                        Submit
-                      </>
-                    )}
-                  </Button>
+                  <div className="flex items-center gap-2">
+                    <Input
+                      autoFocus={openIds.has(s.question_id)}
+                      value={draftText}
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                        onDraftChange(s.question_id, e.target.value)
+                      }
+                      placeholder="Type the patient's answer…"
+                      disabled={busy}
+                      aria-label={`Answer for: ${s.question_text}`}
+                      className="h-8"
+                    />
+                    <Button
+                      type="submit"
+                      size="sm"
+                      disabled={draftText.trim().length === 0 || busy}
+                      className="cursor-pointer"
+                    >
+                      {submitting ? (
+                        <>
+                          <LoaderCircle className="animate-spin" />
+                          Re-scoring
+                        </>
+                      ) : (
+                        <>
+                          <Check />
+                          Submit
+                        </>
+                      )}
+                    </Button>
+                  </div>
+                  {hasOtherPendingDrafts && (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      Submits only this card's answers
+                    </p>
+                  )}
                 </form>
               )}
 

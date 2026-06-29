@@ -52,13 +52,15 @@ export function StreamingStatus({
       )
       break
     case "rescoring": {
-      // Distinct sub-label per SSE stage of the answer stream.
+      // Distinct sub-label per SSE stage of the answer / custom-arm stream.
       const stageLabel =
-        status.stage === "rescored"
-          ? "Updating differential…"
-          : status.stage === "ranking_suggestions"
-            ? "Ranking next questions…"
-            : "Re-scoring arms…"
+        status.stage === "adding_arms"
+          ? "Adding diagnoses…"
+          : status.stage === "rescored"
+            ? "Updating differential…"
+            : status.stage === "ranking_suggestions"
+              ? "Ranking next questions…"
+              : "Re-scoring arms…"
       content = (
         <>
           <LoaderCircle className="size-3.5 animate-spin text-brand" />

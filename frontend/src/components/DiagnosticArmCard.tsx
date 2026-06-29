@@ -24,7 +24,6 @@
  * on-demand lazy expand) it shows sized Skeletons instead.
  */
 
-import { useState } from "react"
 import {
   Activity,
   Check,
@@ -33,6 +32,7 @@ import {
   LoaderCircle,
   Sparkles,
   TriangleAlert,
+  UserPlus,
   X,
 } from "lucide-react"
 
@@ -59,6 +59,9 @@ interface DiagnosticArmCardProps {
   /** This card's batch submit is currently in flight (drives the submit button's
    *  loading state). */
   submitting: boolean
+  /** This arm's score is mid-recalculation (any answer's re-score window) — pulse the
+   *  gauge. Independent of `submitting`: every active arm re-scores, not just this card. */
+  rescoring: boolean
   busy: boolean
   /** Submit every drafted answer in this card together; returns whether it succeeded
    *  (so the card can clear the submitted drafts). */
@@ -68,6 +71,16 @@ interface DiagnosticArmCardProps {
   ) => Promise<boolean>
   /** Remove this arm from the lane (the header close affordance). */
   onClose: (armName: string) => void
+  /** Shared global draft store (keyed by question_id) and its writer — this card reads/
+   *  writes its own questions' drafts here instead of owning local state, so the global
+   *  Re-score control can see them. */
+  drafts: Record<string, string>
+  onDraftChange: (questionId: string, text: string) => void
+  /** Clear the given ids from the shared store (called on this card's own submit only). */
+  onClearDrafts: (ids: string[]) => void
+  /** Total non-empty pending drafts across the WHOLE page — used to detect whether any
+   *  draft exists OUTSIDE this card (count > this card's own pending) for the nudge text. */
+  pendingDraftCount: number
 }
 
 export function DiagnosticArmCard({
@@ -77,14 +90,15 @@ export function DiagnosticArmCard({
   generating,
   expanding,
   submitting,
+  rescoring,
   busy,
   onAnswerBatch,
   onClose,
+  drafts,
+  onDraftChange,
+  onClearDrafts,
+  pendingDraftCount,
 }: DiagnosticArmCardProps) {
-  // Drafts for this card's currently-unanswered questions: questionId -> text. Lives
-  // here (not per row) so the single card-level submit can see across all rows.
-  const [drafts, setDrafts] = useState<Record<string, string>>({})
-
   const flagged = isRedFlagged(arm.reasoning)
   const deprioritized = arm.status === "deprioritized"
   const awaitingQuestions = arm.questions.length === 0
@@ -99,30 +113,24 @@ export function DiagnosticArmCard({
   const unanswered = arm.questions.filter((q) => !q.answered)
   const answered = arm.questions.filter((q) => q.answered)
 
-  // The drafts with real (non-empty) text, ready to submit. A clinician may fill only
-  // some rows, so empty/untouched ones are skipped.
-  const pendingAnswers = Object.entries(drafts)
-    .map(([question_id, value]) => ({ question_id, answer_text: value.trim() }))
+  // This card's own pending answers: its question ids with non-empty text in the SHARED
+  // store. Iterating own ids (not all of `drafts`) scopes the per-card submit to just this
+  // card. A clinician may fill only some rows, so empty/untouched ones are skipped.
+  const pendingAnswers = arm.questions
+    .map((q) => ({ question_id: q.id, answer_text: (drafts[q.id] ?? "").trim() }))
     .filter((a) => a.answer_text.length > 0)
   const canSubmit = pendingAnswers.length > 0 && !busy
-
-  function handleDraftChange(questionId: string, value: string) {
-    setDrafts((d) => ({ ...d, [questionId]: value }))
-  }
+  // A non-empty draft exists somewhere OTHER than this card — disambiguates that this
+  // button submits only this card, not the whole page (the global control does that).
+  const hasOtherPendingDrafts = pendingDraftCount > pendingAnswers.length
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     if (!canSubmit) return
     const submitted = pendingAnswers
     const ok = await onAnswerBatch(arm.name, submitted)
-    if (ok) {
-      // Clear only the drafts we actually submitted, leaving any half-typed rows alone.
-      setDrafts((d) => {
-        const next = { ...d }
-        for (const a of submitted) delete next[a.question_id]
-        return next
-      })
-    }
+    // Clear only the ids we submitted — never any other card's pending drafts.
+    if (ok) onClearDrafts(submitted.map((a) => a.question_id))
   }
 
   return (
@@ -135,7 +143,10 @@ export function DiagnosticArmCard({
       {/* Header (ex-AccordionTrigger): same info, plus an explicit close button where the
           expand/collapse chevron used to be. */}
       <div className="flex items-center gap-3">
-        <ScoreGauge value={arm.relevance_score} />
+        <ScoreGauge
+          value={arm.relevance_score}
+          className={cn(rescoring && "animate-pulse")}
+        />
 
         <div className="flex min-w-0 flex-col items-start gap-1">
           <div className="flex flex-wrap items-center gap-1.5">
@@ -152,6 +163,12 @@ export function DiagnosticArmCard({
               <Badge variant="destructive" className="gap-1">
                 <TriangleAlert />
                 Red flag
+              </Badge>
+            )}
+            {arm.source === "clinician" && (
+              <Badge variant="secondary" className="gap-1 font-normal">
+                <UserPlus />
+                Added by you
               </Badge>
             )}
           </div>
@@ -224,10 +241,15 @@ export function DiagnosticArmCard({
                     question={q}
                     draftValue={drafts[q.id] ?? ""}
                     busy={busy}
-                    onDraftChange={handleDraftChange}
+                    onDraftChange={onDraftChange}
                   />
                 ))}
-                <div className="flex justify-end pt-0.5">
+                <div className="flex items-center justify-end gap-2 pt-0.5">
+                  {hasOtherPendingDrafts && (
+                    <span className="mr-auto text-xs text-muted-foreground">
+                      Submits only this card's answers
+                    </span>
+                  )}
                   <Button
                     type="submit"
                     size="sm"

@@ -29,6 +29,8 @@ interface OpenArmsLaneProps {
   arms: DiagnosticArm[]
   leaderName: string | null
   recentTransitions: Record<string, ScoreTransition>
+  /** Active arms whose score is being recalculated right now — pulses their gauge. */
+  rescoringArmNames: Set<string>
   generating: boolean
   expandingArms: Set<string>
   submittingArm: string | null
@@ -38,6 +40,13 @@ interface OpenArmsLaneProps {
     answers: { question_id: string; answer_text: string }[],
   ) => Promise<boolean>
   onClose: (armName: string) => void
+  /** Shared global draft store + writer/clearer, threaded down to each open arm card so
+   *  its question drafts live in the page-wide store (visible to the global Re-score). */
+  drafts: Record<string, string>
+  onDraftChange: (questionId: string, text: string) => void
+  onClearDrafts: (ids: string[]) => void
+  /** Total non-empty pending drafts across the page — for each card's nudge text. */
+  pendingDraftCount: number
   /** A monotonically-increasing signal + the targeted arm name. When `signal` changes for
    *  a card whose name === `name`, that card scrolls into view and flashes. */
   pulse: { name: string | null; signal: number }
@@ -80,12 +89,17 @@ export function OpenArmsLane({
   arms,
   leaderName,
   recentTransitions,
+  rescoringArmNames,
   generating,
   expandingArms,
   submittingArm,
   busy,
   onAnswerBatch,
   onClose,
+  drafts,
+  onDraftChange,
+  onClearDrafts,
+  pendingDraftCount,
   pulse,
 }: OpenArmsLaneProps) {
   if (openArms.length === 0) return null
@@ -106,9 +120,14 @@ export function OpenArmsLane({
               generating={generating}
               expanding={expandingArms.has(arm.name)}
               submitting={submittingArm === arm.name}
+              rescoring={rescoringArmNames.has(arm.name)}
               busy={busy}
               onAnswerBatch={onAnswerBatch}
               onClose={onClose}
+              drafts={drafts}
+              onDraftChange={onDraftChange}
+              onClearDrafts={onClearDrafts}
+              pendingDraftCount={pendingDraftCount}
             />
           </LaneCard>
         )

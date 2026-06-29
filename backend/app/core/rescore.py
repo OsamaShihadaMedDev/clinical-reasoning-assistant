@@ -8,6 +8,7 @@ Viewer (Section 6b) will later render — the visible proof the loop did somethi
 """
 
 import asyncio
+import re
 
 from app.agents.prioritization import rescore_arms
 from app.agents.suggestion_agent import suggest_questions
@@ -15,6 +16,7 @@ from app.core.orchestration import _active_arms, _qualifying_arms, ensure_arm_qu
 from app.models import (
     AnsweredQuestion,
     ClinicalQuestion,
+    DiagnosticArm,
     Framework,
     HistoryAnswer,
     HistoryChecklist,
@@ -247,3 +249,169 @@ async def process_answers(
         updated_triage, framework, history_checklist, history_answers, transitions
     )
     return updated_triage, transitions, suggestions
+
+
+# --- Clinician-added custom arms (POST /api/arm/custom) -----------------------------
+#
+# A custom-arm addition is, from the rest of the system's perspective, a re-score event:
+# the differential CHANGED (new arms appended) rather than new evidence arriving, so it
+# reuses the same `rescore_arms` + `build_suggestions` + transition-diff machinery the
+# answer path uses. The ONE new piece is the validation/normalization of clinician-typed
+# names; everything else is composition of existing, already-trusted functions.
+
+
+def _arm_name_keys(name: str) -> set[str]:
+    """The set of normalized comparison keys for an arm name, used for duplicate
+    detection. Each key is lowercased and whitespace-collapsed. The set is:
+
+      - the whole name,
+      - the name with any parenthetical groups removed (the "outside" name), and
+      - each parenthetical group's contents, further split on '/' and ',' .
+
+    So "Deep Vein Thrombosis (DVT)" -> {"deep vein thrombosis (dvt)",
+    "deep vein thrombosis", "dvt"} and "Cardiac (ACS / Ischemic)" -> {"cardiac (acs /
+    ischemic)", "cardiac", "acs", "ischemic"}. Two names are treated as duplicates when
+    their key sets intersect — this is what lets a short alias the clinician types ("DVT")
+    match an existing canonical arm name ("Deep Vein Thrombosis (DVT)"). The rule is
+    deliberately CONSERVATIVE (it only catches exact-key overlap, not fuzzy similarity):
+    it will catch parenthetical-abbreviation aliases and case/spacing differences, but it
+    will NOT, by design, flag merely-related distinct diagnoses (e.g. "Pancreatitis" vs
+    "Acute Pancreatitis (AP)") as duplicates.
+    """
+    collapsed = " ".join(name.split()).lower()
+    keys = {collapsed}
+    for group in re.findall(r"\(([^)]*)\)", collapsed):
+        for token in re.split(r"[/,]", group):
+            token = " ".join(token.split())
+            if token:
+                keys.add(token)
+    outside = " ".join(re.sub(r"\([^)]*\)", " ", collapsed).split())
+    if outside:
+        keys.add(outside)
+    keys.discard("")
+    return keys
+
+
+def validate_custom_arm_names(
+    arm_names: list[str], current_triage: TriageOutput
+) -> list[str]:
+    """Read-only pre-flight for POST /api/arm/custom. Cleans and validates the clinician-
+    typed diagnosis names, raising ValueError (-> HTTP 400) on the FIRST problem and
+    returning the cleaned (trimmed, internal-whitespace-collapsed, original-casing) names
+    on success — the same fail-fast discipline as `validate_answer_ids`.
+
+    Rejects: an empty list; any empty/whitespace-only name; a name that duplicates an
+    EXISTING arm (by normalized key overlap — see `_arm_name_keys`, so "DVT" is rejected
+    when "Deep Vein Thrombosis (DVT)" already exists); and duplicates WITHIN the submitted
+    batch by the same rule. Pure and side-effect-free (it does not mutate the triage).
+    """
+    if not arm_names:
+        raise ValueError("Provide at least one diagnosis name to add.")
+
+    existing_keys: set[str] = set()
+    for arm in current_triage.arms:
+        existing_keys |= _arm_name_keys(arm.name)
+
+    cleaned: list[str] = []
+    batch_keys: set[str] = set()
+    for raw in arm_names:
+        name = " ".join(raw.split())  # trim + collapse internal whitespace, keep casing
+        if not name:
+            raise ValueError("Diagnosis names cannot be empty or whitespace only.")
+        keys = _arm_name_keys(name)
+        if keys & existing_keys:
+            raise ValueError(
+                f"A diagnosis matching '{name}' is already in the differential."
+            )
+        if keys & batch_keys:
+            raise ValueError(f"Duplicate diagnosis '{name}' in the submitted list.")
+        batch_keys |= keys
+        cleaned.append(name)
+    return cleaned
+
+
+async def add_custom_arms(
+    arm_names: list[str],
+    current_triage: TriageOutput,
+    patient_context: str,
+) -> list[DiagnosticArm]:
+    """Append clinician-named arms to `current_triage` and generate each one's question
+    set concurrently — but do NOT score them here. Returns the new arms.
+
+    The placeholder `relevance_score`/`reasoning` are TRANSIENT: the caller's very next
+    step (`rescore_for_added_arms`) overwrites them with a real, case-specific score. The
+    placeholder 0.5 is deliberately neutral (not 0 or 1) so that if a re-score somehow
+    failed before reaching this arm, the leftover value reads as "unevaluated", not as a
+    real high/low likelihood. Questions are generated via the SAME `ensure_arm_questions`
+    primitive the expand route uses (concurrently, the same `asyncio.gather` fan-out
+    pattern as the initial population) — there is no second question-generation path.
+
+    Mutates `current_triage.arms` in place by appending all new arms BEFORE any scoring,
+    which is exactly what makes "added together -> scored together" automatic: they are
+    all present in the arm list the single `rescore_arms` call reasons over.
+    """
+    new_arms = [
+        DiagnosticArm(
+            name=name,
+            relevance_score=0.5,  # transient placeholder; overwritten by the re-score
+            reasoning="Newly added — pending evaluation.",  # transient; overwritten
+            status="active",
+            source="clinician",
+            questions=[],
+        )
+        for name in arm_names
+    ]
+    current_triage.arms.extend(new_arms)
+    await asyncio.gather(
+        *(
+            ensure_arm_questions(arm, current_triage.chief_complaint, patient_context)
+            for arm in new_arms
+        )
+    )
+    return new_arms
+
+
+async def rescore_for_added_arms(
+    new_arm_names: list[str],
+    old_scores: dict[str, float],
+    current_triage: TriageOutput,
+    framework: Framework,
+    history_answers: list[HistoryAnswer],
+) -> tuple[TriageOutput, list[ScoreTransition]]:
+    """Re-score EVERY arm jointly after custom arms were added, and diff against the
+    pre-addition scores. The new arms already live in `current_triage.arms` (the caller
+    appended them via `add_custom_arms`), so `rescore_arms`' existing joint reasoning
+    scores them together with — and against — the existing differential, with zero
+    special-casing. The trigger carries no new answers, only `newly_added_arm_names`, so
+    the Prioritization Agent's system prompt explains these arms are freshly introduced.
+
+    `old_scores` must be captured BEFORE the new arms were appended: a brand-new arm has
+    no meaningful "old" score, so only PRE-EXISTING arms can produce a ScoreTransition
+    (the new arms simply appear in the differential with their first real score). The
+    diff logic mirrors `apply_batch_and_rescore`'s exactly.
+    """
+    red_flag_arm_names = {arm.name for arm in framework.arms if arm.red_flag}
+    trigger = RescoreTrigger(
+        new_answers=[],
+        newly_added_arm_names=new_arm_names,
+        current_arms=current_triage.arms,
+    )
+    updated_triage = await rescore_arms(
+        trigger,
+        chief_complaint=current_triage.chief_complaint,
+        red_flag_arm_names=red_flag_arm_names,
+        history_answers=history_answers,
+    )
+
+    trigger_text = "Added: " + ", ".join(new_arm_names)
+    transitions = [
+        ScoreTransition(
+            arm_name=arm.name,
+            old_score=old_scores[arm.name],
+            new_score=arm.relevance_score,
+            trigger_answer=trigger_text,
+        )
+        for arm in updated_triage.arms
+        if arm.name in old_scores and old_scores[arm.name] != arm.relevance_score
+    ]
+    return updated_triage, transitions

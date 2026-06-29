@@ -10,6 +10,13 @@ produces the human-readable justification for it, in the same structured output.
 Keeping them together is what lets the Trace Viewer (6b) show *why* a score is what
 it is, and it is the exact field (`reasoning`) where RAG-sourced citations attach
 in v2 — without restructuring the pipeline.
+
+For the same reason, PROVENANCE lives on this model too (`source`): whether an arm was
+discovered by the Framework Agent at triage or added by the clinician mid-interview is
+clinically meaningful — it distinguishes "the system found this" from "the human caught
+something the system missed" — and, like score/reasoning, it is a fact ABOUT the arm
+that every consumer (UI badge, future audit) needs at the point the arm is rendered. It
+belongs on the arm itself, not in some side table the consumer has to join against.
 """
 
 from typing import Literal
@@ -80,3 +87,13 @@ class DiagnosticArm(BaseModel):
     # initial fan-out (it only scores/reasons); questions are populated in a later,
     # separate step. See judgment-call note in the task report re: this default.
     questions: list[ClinicalQuestion] = Field(default_factory=list)
+
+    # Provenance: did the Framework Agent discover this arm at triage time, or did the
+    # clinician add it mid-interview because they suspected something the system missed?
+    # Clinically meaningful to preserve, not just a UI label — see the module docstring
+    # for why provenance-bearing fields belong on this model directly. Defaults to
+    # "discovered" so every existing pipeline path (triage, re-score) stays correct
+    # without change; only the /api/arm/custom path sets it to "clinician". Provenance is
+    # authoritative in code (the Triage Agent's output is forced to "discovered"), never
+    # taken from the model — the same discipline used for questions/chief_complaint.
+    source: Literal["discovered", "clinician"] = "discovered"

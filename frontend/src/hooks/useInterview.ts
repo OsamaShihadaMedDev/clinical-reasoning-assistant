@@ -15,7 +15,12 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
-import { expandArm as expandArmRequest, openTriageStream, streamAnswers } from "@/api/client"
+import {
+  expandArm as expandArmRequest,
+  openTriageStream,
+  streamAnswers,
+  streamCustomArms,
+} from "@/api/client"
 import type {
   DiagnosticArm,
   HistoryChecklist,
@@ -28,6 +33,12 @@ import type {
  *  (arm cards use their arm name). Sentinels that can't collide with a real arm name. */
 export const HISTORY_CARD_ID = "__history__"
 export const SUGGESTION_CARD_ID = "__suggestions__"
+/** Card identity for the page-wide "Re-score" control that submits EVERY pending draft at
+ *  once (drives its own `submittingArm` loading state, same as the two above). */
+export const GLOBAL_RESCORE_ID = "__global__"
+/** Card identity for the "Add a custom diagnosis" control (drives its own submit/loading
+ *  state via `submittingArm`, like the sentinels above). */
+export const CUSTOM_ARM_ID = "__custom_arm__"
 
 /** Streaming status surfaced near the docked bar (drives StreamingStatus). The
  *  `rescoring` kind now carries the SSE stage so the UI can show distinct sub-labels
@@ -37,7 +48,10 @@ export type StreamStatus =
   | { kind: "scoring" }
   | { kind: "generating"; total: number; filled: number; current: string | null }
   | { kind: "ready" }
-  | { kind: "rescoring"; stage: "rescoring" | "rescored" | "ranking_suggestions" }
+  | {
+      kind: "rescoring"
+      stage: "adding_arms" | "rescoring" | "rescored" | "ranking_suggestions"
+    }
   | { kind: "error"; detail: string }
 
 /** One answered question in the chronological log. Built PER answered question (a batch
@@ -124,6 +138,43 @@ export function useInterview() {
   // Arm names whose questions are being lazily generated on demand (top-N fan-out
   // skipped them; the user just expanded one). Drives a per-arm loading skeleton.
   const [expandingArms, setExpandingArms] = useState<Set<string>>(new Set())
+  // Arm names whose SCORE is currently being recalculated (the in-flight re-score
+  // window), distinct from `recentTransitions` which is the ALREADY-COMPLETED deltas.
+  // The backend re-scores all active arms together in one call (no partial-arm signal),
+  // so this is "all active arms" for the rescoring/rescored/ranking stages; it drives a
+  // localized gauge pulse on each affected card and is cleared on done/error.
+  const [rescoringArmNames, setRescoringArmNames] = useState<Set<string>>(new Set())
+  // ONE shared draft store, keyed by question_id (uniform across arm, suggestion-pool, and
+  // history questions — all carry stable string ids). Lives here, not per component, for
+  // two reasons: (1) the global "Re-score" control can gather pending drafts from EVERY
+  // card at once; (2) the same question shown in two places (a suggestion mirrors an
+  // arm/history question by id) shares one draft instead of two diverging copies — which
+  // also structurally fixes the SuggestionPool overwrite bug (independent ids, no shared
+  // scalar). Components are now presentational over this store.
+  const [drafts, setDrafts] = useState<Record<string, string>>({})
+
+  const setDraft = useCallback((questionId: string, text: string) => {
+    setDrafts((cur) => ({ ...cur, [questionId]: text }))
+  }, [])
+
+  // Clears only the given ids — used by per-card submit (just that card's ids) and the
+  // global submit (every id it just sent). Anything typed afterward (other ids) is left.
+  const clearDrafts = useCallback((ids: string[]) => {
+    setDrafts((cur) => {
+      const next = { ...cur }
+      for (const id of ids) delete next[id]
+      return next
+    })
+  }, [])
+
+  // Count of non-empty pending drafts across the WHOLE store — disables the global
+  // re-score control at zero, shows its "N pending" count, and lets each card cheaply
+  // derive "are there drafts OUTSIDE my own ids" (count > my own pending) for its nudge
+  // text, without re-scanning the store per component.
+  const pendingDraftCount = useMemo(
+    () => Object.values(drafts).filter((t) => t.trim().length > 0).length,
+    [drafts],
+  )
 
   const cleanupRef = useRef<(() => void) | null>(null)
   const prevLeaderRef = useRef<string | null>(null)
@@ -160,6 +211,8 @@ export function useInterview() {
       setLeaderName(null)
       setAnsweredLog([])
       setRecentTransitions({})
+      setRescoringArmNames(new Set())
+      setDrafts({})
       prevLeaderRef.current = null
       setStatus({ kind: "scoring" })
 
@@ -228,6 +281,15 @@ export function useInterview() {
 
       setSubmittingArm(cardId)
       setStatus({ kind: "rescoring", stage: "rescoring" })
+      // Mark every active arm as in-flight for the gauge pulse (the backend re-scores
+      // them all together). Cleared on the stream's done/error below.
+      setRescoringArmNames(
+        new Set(
+          (triage?.arms ?? [])
+            .filter((a) => a.status === "active")
+            .map((a) => a.name),
+        ),
+      )
 
       let ok = false
       await streamAnswers(sessionId, answers, {
@@ -275,16 +337,87 @@ export function useInterview() {
           // Prepend reversed so that within one batch the first-answered reads on top.
           setAnsweredLog((log) => [...entries.reverse(), ...log])
 
+          setRescoringArmNames(new Set()) // new scores landed — stop the gauge pulse
           setStatus({ kind: "ready" })
           ok = true
         },
-        onError: (detail) => setStatus({ kind: "error", detail }),
+        onError: (detail) => {
+          setRescoringArmNames(new Set()) // re-score failed — don't leave a stale pulse
+          setStatus({ kind: "error", detail })
+        },
       })
 
       setSubmittingArm(null)
       return ok
     },
     [sessionId, historyChecklist, triage],
+  )
+
+  // The global "Re-score" control: gather EVERY non-empty draft across all cards and
+  // submit them as ONE combined batch. Reuses answerBatch — the exact same SSE-staged
+  // re-score path as any per-card submit, just with a wider answers[] and a sentinel id.
+  // Clears only the ids it actually sent on success (drafts typed afterward stay).
+  const submitAllDrafts = useCallback(async (): Promise<boolean> => {
+    const answers = Object.entries(drafts)
+      .map(([question_id, value]) => ({ question_id, answer_text: value.trim() }))
+      .filter((a) => a.answer_text.length > 0)
+    if (answers.length === 0) return false
+    const ok = await answerBatch(GLOBAL_RESCORE_ID, answers)
+    if (ok) clearDrafts(answers.map((a) => a.question_id))
+    return ok
+  }, [drafts, answerBatch, clearDrafts])
+
+  // Add one or more clinician-named diagnostic arms, scored TOGETHER server-side against
+  // the case-so-far. Adding a diagnosis IS a re-score, so this drives the SAME staged
+  // status as answerBatch (with a leading `adding_arms` stage) and the same gauge pulse —
+  // it should feel like every other re-score, not a separate loading state. It does NOT
+  // create an answered-log entry (no question was answered); the new arms appearing in the
+  // differential + the gauge deltas are the visible feedback.
+  const addCustomArms = useCallback(
+    async (names: string[]): Promise<boolean> => {
+      if (!sessionId || names.length === 0) return false
+
+      setSubmittingArm(CUSTOM_ARM_ID)
+      setStatus({ kind: "rescoring", stage: "adding_arms" })
+      // Pulse the EXISTING active arms for the in-flight window (the new arms don't exist
+      // client-side until `done`); cleared on done/error, exactly like answerBatch.
+      setRescoringArmNames(
+        new Set(
+          (triage?.arms ?? [])
+            .filter((a) => a.status === "active")
+            .map((a) => a.name),
+        ),
+      )
+
+      let ok = false
+      await streamCustomArms(sessionId, names, {
+        onAddingArms: () => setStatus({ kind: "rescoring", stage: "adding_arms" }),
+        onRescoring: () => setStatus({ kind: "rescoring", stage: "rescoring" }),
+        onRescored: (transitions) => {
+          setStatus({ kind: "rescoring", stage: "rescored" })
+          const map: Record<string, ScoreTransition> = {}
+          for (const t of transitions) map[t.arm_name] = t
+          setRecentTransitions(map)
+        },
+        onRankingSuggestions: () =>
+          setStatus({ kind: "rescoring", stage: "ranking_suggestions" }),
+        onDone: (res) => {
+          setTriage(res.triage)
+          setSuggestions(res.suggestions)
+          setRescoringArmNames(new Set())
+          setStatus({ kind: "ready" })
+          ok = true
+        },
+        onError: (detail) => {
+          setRescoringArmNames(new Set())
+          setStatus({ kind: "error", detail })
+        },
+      })
+
+      setSubmittingArm(null)
+      return ok
+    },
+    [sessionId, triage],
   )
 
   // Lazily generate questions for ONE arm the top-N fan-out skipped, when the user
@@ -361,8 +494,15 @@ export function useInterview() {
     recentTransitions,
     submittingArm,
     expandingArms,
+    rescoringArmNames,
+    drafts,
+    setDraft,
+    clearDrafts,
+    pendingDraftCount,
     start,
     answerBatch,
+    submitAllDrafts,
+    addCustomArms,
     expandArm,
   }
 }

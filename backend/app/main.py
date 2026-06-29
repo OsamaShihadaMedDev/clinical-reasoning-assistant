@@ -32,11 +32,14 @@ from app.core.orchestration import (
     populate_questions_streaming,
 )
 from app.core.rescore import (
+    add_custom_arms,
     apply_batch_and_rescore,
     build_suggestions,
     process_answers,
     promote_newly_qualified,
+    rescore_for_added_arms,
     validate_answer_ids,
+    validate_custom_arm_names,
 )
 from app.models import (
     DiagnosticArm,
@@ -154,6 +157,21 @@ class ArmExpandRequest(BaseModel):
 
 class ArmExpandResponse(BaseModel):
     arm: DiagnosticArm
+
+
+class CustomArmRequest(BaseModel):
+    session_id: str
+    # One or more clinician-typed diagnosis names to add to the differential at once.
+    # Added (and therefore scored) TOGETHER — see /api/arm/custom.
+    arm_names: list[str]
+
+
+# NOTE: /api/arm/custom STREAMS its result over SSE (like /api/answers), so there is no
+# CustomArmResponse model — the terminal `done` frame carries the exact same shape as
+# AnswerResponse (triage, transitions, suggestions), and the React client reuses its
+# existing AnswerResponse handling on `done`. A custom-arm addition IS a re-score event
+# from the rest of the system's perspective, so it produces the same output and the same
+# staged loading feedback every other re-score already shows.
 
 
 @app.get("/health")
@@ -528,3 +546,116 @@ async def expand_arm(request: ArmExpandRequest) -> ArmExpandResponse:
     )
     _SESSIONS[request.session_id] = session  # arm mutated in place; re-store for clarity
     return ArmExpandResponse(arm=arm)
+
+
+async def _custom_arm_event_stream(
+    session_id: str, arm_names: list[str]
+) -> AsyncIterator[str]:
+    """SSE body for POST /api/arm/custom: add clinician-named arms and re-score, streaming
+    the SAME staged events the answer stream does (plus a leading `adding_arms`) so adding
+    a diagnosis feels like every other re-score, not a separate unstyled load.
+
+    Emits, in order:
+      1. `adding_arms`         — Data: {"names": [...]}. Before question generation.
+      2. `rescoring`           — Data: {"arm_count": N}. Before the Prioritization call.
+      3. `rescored`            — Data: {"transitions": [...]} (pre-existing arms that moved).
+      4. `ranking_suggestions` — Data: {} (stage marker).
+      5. `done`                — the FULL AnswerResponse shape (triage, transitions,
+                                 suggestions), so the client reuses its `done` handling.
+      6. `error`               — any mid-stream failure; data {"detail": ...}.
+
+    Session existence and name validity are checked SYNCHRONOUSLY by the route before this
+    runs (normal 404/400), so only the agent calls here can fail mid-stream — same
+    per-stage fail-loud-to-client discipline as the answer stream. It composes the same
+    reusable rescore.py steps the answer path does.
+    """
+    session = _SESSIONS[session_id]  # guaranteed present: the route validated it.
+    try:
+        yield _sse("adding_arms", {"names": arm_names})
+
+        # Snapshot existing scores BEFORE appending — a brand-new arm has no "old" score,
+        # so only pre-existing arms can yield a transition.
+        old_scores = {arm.name: arm.relevance_score for arm in session.triage.arms}
+        new_arms = await add_custom_arms(
+            arm_names, session.triage, session.patient_context
+        )
+
+        # arm_count now includes the new active arms (they're all scored together).
+        yield _sse("rescoring", {"arm_count": len(_active_arms(session.triage))})
+        updated, transitions = await rescore_for_added_arms(
+            [arm.name for arm in new_arms],
+            old_scores,
+            session.triage,
+            session.framework,
+            session.history_answers,
+        )
+        yield _sse("rescored", {"transitions": [t.model_dump() for t in transitions]})
+
+        # Same post-rescore promotion the answer path runs: an existing arm the re-score
+        # lifted into the top N gets its questions so the suggestion pool can rank them.
+        await promote_newly_qualified(session.triage, updated, session.patient_context)
+
+        yield _sse("ranking_suggestions", {})
+        suggestions = await build_suggestions(
+            updated,
+            session.framework,
+            session.history_checklist,
+            session.history_answers,
+            transitions,
+        )
+    except Exception as exc:  # noqa: BLE001 — fail loud TO THE CLIENT, like the other streams
+        yield _sse("error", {"detail": str(exc)})
+        return
+
+    _SESSIONS[session_id] = _Session(
+        triage=updated,
+        patient_context=session.patient_context,
+        framework=session.framework,
+        history_checklist=session.history_checklist,
+        history_answers=session.history_answers,
+        suggestions=suggestions,
+    )
+    yield _sse(
+        "done",
+        {
+            "triage": updated.model_dump(),
+            "transitions": [t.model_dump() for t in transitions],
+            "suggestions": suggestions.model_dump(),
+        },
+    )
+
+
+@app.post("/api/arm/custom")
+async def add_custom_arms_route(request: CustomArmRequest) -> StreamingResponse:
+    """Add one or more clinician-named diagnostic arms to the differential, scored TOGETHER
+    against the full case-so-far, STREAMING the stages over SSE (sibling to /api/arm/expand,
+    but a re-score-shaped action so it streams like /api/answers).
+
+    Each new arm becomes a real `DiagnosticArm` (source="clinician") with an agent-generated
+    question set (same `ensure_arm_questions` path as expand) and a real score from the
+    same joint `rescore_arms` call every answer triggers — so multiple names added at once
+    are reasoned about together, accounting for each other, with no special-casing.
+
+    Validation is synchronous and up front so it returns normal HTTP errors, not SSE error
+    frames: 404 if the session is gone, 400 if a name is empty or duplicates an existing
+    arm (case-insensitive, alias-aware — see validate_custom_arm_names)."""
+    session = _SESSIONS.get(request.session_id)
+    if session is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No active session '{request.session_id}'. Start a new interview "
+                f"via POST /api/triage first (sessions are in-memory and reset when "
+                f"the server restarts)."
+            ),
+        )
+    try:
+        cleaned_names = validate_custom_arm_names(request.arm_names, session.triage)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return StreamingResponse(
+        _custom_arm_event_stream(request.session_id, cleaned_names),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

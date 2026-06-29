@@ -25,6 +25,10 @@ export interface DiagnosticArm {
   reasoning: string
   status: "active" | "deprioritized"
   questions: ClinicalQuestion[]
+  /** Provenance: "discovered" by the Framework Agent at triage, or "clinician" if the
+   *  clinician added it mid-interview via /api/arm/custom. Always present (backend
+   *  defaults it to "discovered"); drives the "Added by you" provenance badge. */
+  source: "discovered" | "clinician"
 }
 
 /** The Triage Agent's output: the complaint plus its scored arms.

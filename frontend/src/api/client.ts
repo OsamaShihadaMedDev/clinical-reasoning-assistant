@@ -219,6 +219,94 @@ export async function streamAnswers(
   if (leftover) dispatch(parseSSEFrame(leftover))
 }
 
+export interface CustomArmStreamHandlers {
+  /** New arms accepted; their questions are being generated. Data: the names. */
+  onAddingArms: (names: string[]) => void
+  /** Re-score started; `armCount` active arms (incl. the new ones) are being weighed. */
+  onRescoring: (armCount: number) => void
+  /** Arms re-scored; transitions for the pre-existing arms that moved. */
+  onRescored: (transitions: ScoreTransition[]) => void
+  /** Suggestion ranking started. */
+  onRankingSuggestions: () => void
+  /** Finished: the full AnswerResponse (same shape the answer stream's `done` carries). */
+  onDone: (response: AnswerResponse) => void
+  /** A pre-stream HTTP error (404/400) or a mid-stream `error` frame. */
+  onError: (detail: string) => void
+}
+
+/**
+ * POST /api/arm/custom and consume its SSE stream — add one or more clinician-named
+ * diagnostic arms, scored TOGETHER against the case-so-far. Adding a diagnosis is a
+ * re-score event, so this mirrors `streamAnswers` exactly (POST + ReadableStream + the
+ * shared SSE frame helpers); it just has one extra leading `adding_arms` stage and the
+ * same `done` payload shape, so the hook reuses its answer-`done` handling.
+ */
+export async function streamCustomArms(
+  sessionId: string,
+  armNames: string[],
+  handlers: CustomArmStreamHandlers,
+): Promise<void> {
+  const res = await fetch("/api/arm/custom", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: sessionId, arm_names: armNames }),
+  })
+
+  // Pre-stream HTTP errors (404 missing session, 400 empty/duplicate name) arrive as a
+  // normal JSON error body, not an SSE frame — surface them the same way.
+  if (!res.ok || !res.body) {
+    let detail = res.statusText
+    try {
+      detail = ((await res.json()) as { detail?: string }).detail || detail
+    } catch {
+      /* keep fallback */
+    }
+    handlers.onError(detail)
+    return
+  }
+
+  const dispatch = ({ event, data }: { event: string; data: string }) => {
+    switch (event) {
+      case "adding_arms":
+        handlers.onAddingArms((JSON.parse(data) as { names: string[] }).names)
+        break
+      case "rescoring":
+        handlers.onRescoring((JSON.parse(data) as { arm_count: number }).arm_count)
+        break
+      case "rescored":
+        handlers.onRescored(
+          (JSON.parse(data) as { transitions: ScoreTransition[] }).transitions,
+        )
+        break
+      case "ranking_suggestions":
+        handlers.onRankingSuggestions()
+        break
+      case "done":
+        handlers.onDone(JSON.parse(data) as AnswerResponse)
+        break
+      case "error":
+        handlers.onError(
+          (JSON.parse(data) as { detail?: string }).detail || "stream error",
+        )
+        break
+    }
+  }
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  for (;;) {
+    const { value, done } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const { frames, rest } = splitSSEFrames(buffer)
+    buffer = rest
+    for (const frame of frames) dispatch(parseSSEFrame(frame))
+  }
+  const leftover = buffer.trim()
+  if (leftover) dispatch(parseSSEFrame(leftover))
+}
+
 /** POST /api/arm/expand — lazily generate questions for ONE arm the top-N fan-out
  *  skipped. Idempotent server-side: an already-populated arm comes back unchanged
  *  (no regeneration), so the UI can call this whenever a question-less arm opens

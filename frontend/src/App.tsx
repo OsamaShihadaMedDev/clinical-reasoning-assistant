@@ -2,15 +2,18 @@
  * App — wires the interview together. The ComplaintBar morphs hero → docked; once
  * started, the page is a three-zone differential workspace (single column, stacked):
  *
- *   1. ComplaintBar (hero ↔ docked)
- *   2. SuggestionPool — the ranked "what to ask next" surface (inline answer + a new
- *      "Expand full card" jump to the relevant arm/General History)
- *   3. OpenArmsLane — up to 3 full arm cards the clinician is actively working
- *   4. DifferentialGrid — the remaining arms as compact closed tiles; the full General
- *      History card is pinned FIRST in this same area (option b: rendered here by App,
- *      not threaded through the grid, to avoid prop-drilling its 5 props)
- *   5. AnsweredLog — the chronological record (evolved Trace Viewer)
+ *   1. ComplaintBar (hero ↔ docked) — also hosts the page-wide "Re-score" control
+ *   2. DifferentialGrid — orientation: current scores + red flags, visible immediately
+ *   3. HistoryCard — orientation: history status (collapsed-by-default pinned entry point)
+ *   4. SuggestionPool — action: what to ask next ("Expand full card" jumps to arm/history)
+ *   5. OpenArmsLane — up to 3 full arm cards the clinician is actively working
+ *   6. AnsweredLog — the chronological record (evolved Trace Viewer)
  *
+ * Orientation surfaces (2–3) sit ABOVE the action surface (4): the clinician sees the
+ * current differential + history status before being prompted to act.
+ *
+ * Drafts are a SINGLE shared store in useInterview (keyed by question_id); every card
+ * reads/writes it, and the global "Re-score" control submits all pending drafts at once.
  * All data comes from the two SSE streams (triage + answer) via useInterview — no mocks.
  */
 
@@ -24,6 +27,8 @@ import { OpenArmsLane } from "@/components/OpenArmsLane"
 import { SuggestionPool } from "@/components/SuggestionPool"
 import { Skeleton } from "@/components/ui/skeleton"
 import {
+  CUSTOM_ARM_ID,
+  GLOBAL_RESCORE_ID,
   HISTORY_CARD_ID,
   SUGGESTION_CARD_ID,
   useInterview,
@@ -62,12 +67,22 @@ export default function App() {
     signal: 0,
   })
   const historyRef = useRef<HTMLDivElement>(null)
+  // General History's expand state lives HERE (not inside HistoryCard) so a history-
+  // targeted suggestion's "Expand full card" can open it directly — scrolling to a still-
+  // collapsed tile would be a silent no-op, the same failure the lane pulse already fixes.
+  const [historyExpanded, setHistoryExpanded] = useState(false)
 
   const busy =
     iv.status.kind === "scoring" ||
     iv.status.kind === "generating" ||
     iv.status.kind === "rescoring"
   const generating = iv.status.kind === "generating"
+
+  // Names of clinician-added arms, so the suggestion pool can mark a source-arm tag as
+  // "added by you" (the grid tile / lane card read arm.source directly).
+  const clinicianArmNames = new Set(
+    iv.arms.filter((a) => a.source === "clinician").map((a) => a.name),
+  )
 
   // From a suggestion's "Expand full card": open the arm (no-op if already open) and
   // pulse it. Grid-tile taps go straight to iv.openArm (no pulse) — the arm was closed,
@@ -77,11 +92,14 @@ export default function App() {
     setPulse((p) => ({ name: armName, signal: p.signal + 1 }))
   }
 
-  // General History isn't lane-eligible (pinned in the differential area), so "expand"
-  // for a history suggestion means scroll it into view. It's never mobile-collapsed
-  // (HistoryCard has no collapse state), so scrolling is the whole action.
+  // General History isn't lane-eligible, so "expand" for a history suggestion means open
+  // its (collapsed-by-default) card AND scroll it into view. Expand first, then scroll on
+  // the next frame so the now-expanded card is what gets centred.
   function openHistory() {
-    historyRef.current?.scrollIntoView({ behavior: "smooth", block: "center" })
+    setHistoryExpanded(true)
+    requestAnimationFrame(() =>
+      historyRef.current?.scrollIntoView({ behavior: "smooth", block: "center" }),
+    )
   }
 
   return (
@@ -92,6 +110,9 @@ export default function App() {
         status={iv.status}
         onStart={iv.start}
         onHeightChange={setBarHeight}
+        pendingDraftCount={iv.pendingDraftCount}
+        rescoreSubmitting={iv.submittingArm === GLOBAL_RESCORE_ID}
+        onRescoreAll={iv.submitAllDrafts}
       />
 
       <main
@@ -100,34 +121,27 @@ export default function App() {
       >
         {iv.started && (
           <>
-            {/* 1. Ranked suggestion pool — the primary "what to ask next" surface. */}
-            <SuggestionPool
-              suggestions={iv.suggestions}
-              busy={busy}
-              submitting={iv.submittingArm === SUGGESTION_CARD_ID}
-              onAnswerBatch={iv.answerBatch}
-              onOpenArm={openArmFromSuggestion}
-              onOpenHistory={openHistory}
-            />
+            {/* 1. Orientation — the differential (current scores + red flags), shown
+                immediately so the clinician is oriented before being prompted to act. */}
+            {iv.arms.length === 0 ? (
+              <GridSkeleton />
+            ) : (
+              <DifferentialGrid
+                arms={iv.arms}
+                openArms={iv.openArms}
+                recentTransitions={iv.recentTransitions}
+                rescoringArmNames={iv.rescoringArmNames}
+                suggestions={iv.suggestions}
+                leaderName={iv.leaderName}
+                onOpen={iv.openArm}
+                onAddCustomArms={iv.addCustomArms}
+                adding={iv.submittingArm === CUSTOM_ARM_ID}
+                busy={busy}
+              />
+            )}
 
-            {/* 2. Open Cards Lane — the arms being actively worked (renders nothing when
-                empty). */}
-            <OpenArmsLane
-              openArms={iv.openArms}
-              arms={iv.arms}
-              leaderName={iv.leaderName}
-              recentTransitions={iv.recentTransitions}
-              generating={generating}
-              expandingArms={iv.expandingArms}
-              submittingArm={iv.submittingArm}
-              busy={busy}
-              onAnswerBatch={iv.answerBatch}
-              onClose={iv.closeArm}
-              pulse={pulse}
-            />
-
-            {/* 3. General History — pinned first in the differential area (see header
-                comment / option b). Wrapped so the suggestion "expand" can scroll to it. */}
+            {/* 2. Orientation — General History status (collapsed-by-default pinned entry
+                point). Wrapped so openHistory can scroll to it. */}
             {iv.historyChecklist && (
               <div ref={historyRef}>
                 <HistoryCard
@@ -136,23 +150,51 @@ export default function App() {
                   submitting={iv.submittingArm === HISTORY_CARD_ID}
                   busy={busy}
                   onAnswerBatch={iv.answerBatch}
+                  expanded={historyExpanded}
+                  onExpandedChange={setHistoryExpanded}
+                  drafts={iv.drafts}
+                  onDraftChange={iv.setDraft}
+                  onClearDrafts={iv.clearDrafts}
+                  pendingDraftCount={iv.pendingDraftCount}
                 />
               </div>
             )}
 
-            {/* 4. Closed Grid — the remaining (not-open) arms as compact tiles. */}
-            {iv.arms.length === 0 ? (
-              <GridSkeleton />
-            ) : (
-              <DifferentialGrid
-                arms={iv.arms}
-                openArms={iv.openArms}
-                recentTransitions={iv.recentTransitions}
-                suggestions={iv.suggestions}
-                leaderName={iv.leaderName}
-                onOpen={iv.openArm}
-              />
-            )}
+            {/* 3. Action — the ranked "what to ask next" surface. */}
+            <SuggestionPool
+              suggestions={iv.suggestions}
+              busy={busy}
+              submitting={iv.submittingArm === SUGGESTION_CARD_ID}
+              onAnswerBatch={iv.answerBatch}
+              onOpenArm={openArmFromSuggestion}
+              onOpenHistory={openHistory}
+              drafts={iv.drafts}
+              onDraftChange={iv.setDraft}
+              onClearDrafts={iv.clearDrafts}
+              pendingDraftCount={iv.pendingDraftCount}
+              clinicianArmNames={clinicianArmNames}
+            />
+
+            {/* 4. Open Cards Lane — the arms being actively worked (renders nothing when
+                empty). */}
+            <OpenArmsLane
+              openArms={iv.openArms}
+              arms={iv.arms}
+              leaderName={iv.leaderName}
+              recentTransitions={iv.recentTransitions}
+              rescoringArmNames={iv.rescoringArmNames}
+              generating={generating}
+              expandingArms={iv.expandingArms}
+              submittingArm={iv.submittingArm}
+              busy={busy}
+              onAnswerBatch={iv.answerBatch}
+              onClose={iv.closeArm}
+              drafts={iv.drafts}
+              onDraftChange={iv.setDraft}
+              onClearDrafts={iv.clearDrafts}
+              pendingDraftCount={iv.pendingDraftCount}
+              pulse={pulse}
+            />
 
             {/* 5. Answered log (full width, the evolved Trace Viewer). */}
             <AnsweredLog entries={iv.answeredLog} />

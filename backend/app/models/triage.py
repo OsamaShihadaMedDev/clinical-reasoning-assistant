@@ -3,7 +3,7 @@ that re-triggers it when the user submits one or more answers from a card (the
 feedback loop).
 """
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.models.clinical import DiagnosticArm
 
@@ -57,6 +57,16 @@ class RescoreTrigger(BaseModel):
 
     # The batch of questions newly answered since the last re-score (one card's worth).
     new_answers: list[AnsweredQuestion]
+
+    # Arms the CLINICIAN just added mid-interview (the /api/arm/custom path), if any.
+    # A re-score is normally triggered by new answers; this is the one other trigger —
+    # "the differential itself changed, not the evidence." When non-empty (and
+    # new_answers may be empty), the Prioritization Agent is told these specific arms are
+    # newly introduced, carry a placeholder score to replace, and have no answered-question
+    # history of their own yet — but must still be scored against everything already known
+    # about the case, jointly with the existing arms (see prioritization._build_system_prompt).
+    # Default empty so every existing answer-driven re-score is unaffected.
+    newly_added_arm_names: list[str] = Field(default_factory=list)
 
     # The FULL current arm state, not just the new answers. Re-scoring is a *revision*
     # of prior scores and reasoning, not a fresh calculation from scratch — the agent
