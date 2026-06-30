@@ -15,6 +15,7 @@ from app.models.history import (
     PatientCategory,
     is_history_question_id,
 )
+from app.models.investigation import InvestigationBatch, InvestigationSuggestion
 from app.models.suggestion import SuggestedQuestion, SuggestionBatch
 from app.models.triage import AnsweredQuestion, RescoreTrigger, TriageOutput
 from app.models.trace import ScoreTransition
@@ -31,6 +32,8 @@ __all__ = [
     "HistoryQuestion",
     "PatientCategory",
     "is_history_question_id",
+    "InvestigationBatch",
+    "InvestigationSuggestion",
     "SuggestedQuestion",
     "SuggestionBatch",
     "TriageOutput",

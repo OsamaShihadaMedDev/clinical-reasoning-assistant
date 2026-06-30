@@ -16,6 +16,7 @@ import type {
   ArmQuestionsEvent,
   ClinicalQuestion,
   HistoryChecklist,
+  InvestigationBatch,
   ScoreTransition,
   SuggestionBatch,
   TriageOutput,
@@ -332,4 +333,30 @@ export async function expandArm(
   }
 
   return (await res.json()) as ArmExpandResponse
+}
+
+/** POST /api/investigations — on-demand workup suggestions (tests/imaging) for the
+ *  session's current state. Plain JSON request/response (no SSE: it's one model call,
+ *  not a multi-stage re-score), so this is a simple fetch like `expandArm`, not a stream
+ *  parser. Throws Error(detail) on a non-2xx. */
+export async function suggestInvestigations(
+  sessionId: string,
+): Promise<InvestigationBatch> {
+  const res = await fetch("/api/investigations", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: sessionId }),
+  })
+
+  if (!res.ok) {
+    let detail = res.statusText
+    try {
+      detail = ((await res.json()) as { detail?: string }).detail || detail
+    } catch {
+      /* keep fallback */
+    }
+    throw new Error(detail)
+  }
+
+  return (await res.json()) as InvestigationBatch
 }

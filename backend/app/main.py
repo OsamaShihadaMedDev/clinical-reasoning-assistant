@@ -24,6 +24,7 @@ from pydantic import BaseModel
 
 from app.agents.framework_agent import resolve_framework
 from app.agents.history_agent import resolve_history_checklist
+from app.agents.investigation_agent import suggest_investigations
 from app.agents.triage import run_triage
 from app.core.orchestration import (
     _active_arms,
@@ -46,6 +47,7 @@ from app.models import (
     Framework,
     HistoryAnswer,
     HistoryChecklist,
+    InvestigationBatch,
     ScoreTransition,
     SuggestionBatch,
     TriageOutput,
@@ -164,6 +166,13 @@ class CustomArmRequest(BaseModel):
     # One or more clinician-typed diagnosis names to add to the differential at once.
     # Added (and therefore scored) TOGETHER — see /api/arm/custom.
     arm_names: list[str]
+
+
+class InvestigationRequest(BaseModel):
+    # On-demand workup suggestions for a session's current state. Only the session id is
+    # needed: this is a pure read+suggest snapshot, so the route reads everything else
+    # (triage, patient_context, history_answers, framework) from the stored session.
+    session_id: str
 
 
 # NOTE: /api/arm/custom STREAMS its result over SSE (like /api/answers), so there is no
@@ -546,6 +555,49 @@ async def expand_arm(request: ArmExpandRequest) -> ArmExpandResponse:
     )
     _SESSIONS[request.session_id] = session  # arm mutated in place; re-store for clarity
     return ArmExpandResponse(arm=arm)
+
+
+@app.post("/api/investigations", response_model=InvestigationBatch)
+async def suggest_investigations_route(
+    request: InvestigationRequest,
+) -> InvestigationBatch:
+    """On-demand workup suggestions (tests/imaging to consider) for the session as it
+    stands right now — routine baseline plus per-arm specialized.
+
+    Distinct from /api/answers and /api/arm/custom: this is NOT a re-score and has NO
+    session-state side effect. It does not stage over SSE (unlike /api/arm/custom — there
+    is nothing multi-stage happening, just one model call), so it's plain JSON request/
+    response, same shape as /api/arm/expand. The clinician can call it as many times as
+    they like; each call is an independent snapshot and nothing is persisted to _SESSIONS.
+    """
+    session = _SESSIONS.get(request.session_id)
+    if session is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No active session '{request.session_id}'. Start a new interview "
+                f"via POST /api/triage first (sessions are in-memory and reset when "
+                f"the server restarts)."
+            ),
+        )
+
+    # Red-flag arm names come from the framework, the same source rescore.py's safety
+    # check uses (stored once on the session, not re-resolved per call).
+    red_flag_arm_names = {arm.name for arm in session.framework.arms if arm.red_flag}
+
+    # Total answered = every answered arm question + every recorded history answer. The
+    # frontend keeps this as the staleness baseline (this pane does not auto-refresh).
+    total_answered_count = sum(
+        1 for arm in session.triage.arms for q in arm.questions if q.answered
+    ) + len(session.history_answers)
+
+    return await suggest_investigations(
+        triage_output=session.triage,
+        patient_context=session.patient_context,
+        history_answers=session.history_answers,
+        red_flag_arm_names=red_flag_arm_names,
+        total_answered_count=total_answered_count,
+    )
 
 
 async def _custom_arm_event_stream(

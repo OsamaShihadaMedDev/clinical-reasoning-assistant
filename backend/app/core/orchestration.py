@@ -17,7 +17,7 @@ import asyncio
 from collections.abc import AsyncIterator, Awaitable
 
 from app.agents.question_generator import generate_questions
-from app.config import TOP_N_AUTO_GENERATE
+from app.config import TOP_N_AUTO_GENERATE, TOP_N_INVESTIGATION_ARMS
 from app.models import ClinicalQuestion, DiagnosticArm, TriageOutput
 
 
@@ -57,6 +57,23 @@ def _qualifying_arms(triage_output: TriageOutput) -> list[DiagnosticArm]:
         reverse=True,
     )
     return active[:TOP_N_AUTO_GENERATE]
+
+
+def _top_investigation_arms(triage_output: TriageOutput) -> list[DiagnosticArm]:
+    """The arms eligible for a Specialized investigation suggestion: the top
+    `TOP_N_INVESTIGATION_ARMS` ACTIVE arms by score. Same two-gate pattern as
+    `_qualifying_arms` (status first via `_active_arms`, then rank) — kept as its own
+    function rather than reusing `_qualifying_arms` directly because the two cutoffs
+    (TOP_N_AUTO_GENERATE vs TOP_N_INVESTIGATION_ARMS) are independent product knobs
+    that happen to share a shape, not the same concept; a future change to one must
+    not silently change the other.
+    """
+    active = sorted(
+        _active_arms(triage_output),
+        key=lambda arm: arm.relevance_score,
+        reverse=True,
+    )
+    return active[:TOP_N_INVESTIGATION_ARMS]
 
 
 async def ensure_arm_questions(

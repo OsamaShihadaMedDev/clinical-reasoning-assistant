@@ -11,7 +11,7 @@
  */
 
 import { useEffect, useRef, useState } from "react"
-import { Stethoscope } from "lucide-react"
+import { FlaskConical, LoaderCircle, Stethoscope } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -34,6 +34,11 @@ interface ComplaintBarProps {
   pendingDraftCount: number
   rescoreSubmitting: boolean
   onRescoreAll: () => void
+  /** On-demand "Suggest workup" control (anchored beside Re-score): its in-flight flag and
+   *  the handler that requests a fresh investigation snapshot. Same prop-drilling pattern as
+   *  onRescoreAll, but a visually distinct (outline) button — it is not a re-score twin. */
+  investigationsLoading: boolean
+  onSuggestInvestigations: () => void
 }
 
 export function ComplaintBar({
@@ -45,6 +50,8 @@ export function ComplaintBar({
   pendingDraftCount,
   rescoreSubmitting,
   onRescoreAll,
+  investigationsLoading,
+  onSuggestInvestigations,
 }: ComplaintBarProps) {
   const [chiefComplaint, setChiefComplaint] = useState("chest pain")
   const [patientContext, setPatientContext] = useState(
@@ -174,12 +181,37 @@ export function ComplaintBar({
           {docked && (
             <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
               <StreamingStatus status={status} />
-              <GlobalRescoreButton
-                pendingCount={pendingDraftCount}
-                submitting={rescoreSubmitting}
-                busy={busy}
-                onRescore={onRescoreAll}
-              />
+              <div className="flex flex-wrap items-center gap-2">
+                {/* On-demand workup snapshot. Distinct outline styling so it doesn't read
+                    as a second Re-score; disabled while any stream is busy (don't snapshot
+                    mid-re-score) or while its own request is in flight. */}
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={onSuggestInvestigations}
+                  disabled={busy || investigationsLoading}
+                  className="cursor-pointer gap-1.5"
+                >
+                  {investigationsLoading ? (
+                    <>
+                      <LoaderCircle className="animate-spin" />
+                      Suggesting…
+                    </>
+                  ) : (
+                    <>
+                      <FlaskConical />
+                      Suggest workup
+                    </>
+                  )}
+                </Button>
+                <GlobalRescoreButton
+                  pendingCount={pendingDraftCount}
+                  submitting={rescoreSubmitting}
+                  busy={busy}
+                  onRescore={onRescoreAll}
+                />
+              </div>
             </div>
           )}
         </div>

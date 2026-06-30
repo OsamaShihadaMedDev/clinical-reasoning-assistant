@@ -20,10 +20,12 @@ import {
   openTriageStream,
   streamAnswers,
   streamCustomArms,
+  suggestInvestigations as suggestInvestigationsRequest,
 } from "@/api/client"
 import type {
   DiagnosticArm,
   HistoryChecklist,
+  InvestigationBatch,
   ScoreTransition,
   SuggestionBatch,
   TriageOutput,
@@ -39,6 +41,10 @@ export const GLOBAL_RESCORE_ID = "__global__"
 /** Card identity for the "Add a custom diagnosis" control (drives its own submit/loading
  *  state via `submittingArm`, like the sentinels above). */
 export const CUSTOM_ARM_ID = "__custom_arm__"
+/** Card identity for the on-demand "Suggest workup" control. Drives its own loading state
+ *  via `submittingArm` (App derives `iv.submittingArm === INVESTIGATION_ID`), the same way
+ *  GLOBAL_RESCORE_ID does — NOT a bespoke boolean living apart from the rest. */
+export const INVESTIGATION_ID = "__investigations__"
 
 /** Streaming status surfaced near the docked bar (drives StreamingStatus). The
  *  `rescoring` kind now carries the SSE stage so the UI can show distinct sub-labels
@@ -120,6 +126,15 @@ export function useInterview() {
   // The ranked "what to ask next" pool (SSE `suggestions` event at start; refreshed on
   // every answer stream's `done`).
   const [suggestions, setSuggestions] = useState<SuggestionBatch | null>(null)
+  // On-demand workup suggestions (Investigation Agent). null until the clinician first
+  // clicks "Suggest workup" — that null IS the "pane doesn't exist yet" signal (App renders
+  // the right pane conditionally on this, not on a separate boolean). It does NOT
+  // auto-refresh: `investigationsAnsweredCount` is the answered-count snapshot at generation
+  // time, kept separately so the staleness comparison doesn't re-derive it from the batch.
+  const [investigations, setInvestigations] = useState<InvestigationBatch | null>(null)
+  const [investigationsAnsweredCount, setInvestigationsAnsweredCount] = useState<
+    number | null
+  >(null)
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [status, setStatus] = useState<StreamStatus>({ kind: "idle" })
   // The arms whose FULL question card is open in the Open Cards Lane, ordered oldest ->
@@ -186,6 +201,18 @@ export function useInterview() {
     return [...triage.arms].sort((a, b) => b.relevance_score - a.relevance_score)
   }, [triage])
 
+  // Total answered questions across the page — answered arm questions + answered general-
+  // history questions. Mirrors the backend's count (answered=True arm questions + history
+  // answers) so the investigation pane's staleness line ("M new since") compares like with
+  // like against the batch's `generated_at_answer_count`.
+  const totalAnsweredCount = useMemo(() => {
+    const armAnswered = (triage?.arms ?? []).reduce(
+      (n, arm) => n + arm.questions.filter((q) => q.answered).length,
+      0,
+    )
+    return armAnswered + Object.keys(answeredHistory).length
+  }, [triage, answeredHistory])
+
   // Track the leader (for the differential strip's "Leading" highlight). Data-driven
   // and tie-stable via computeLeader. It no longer auto-expands anything — the arm
   // detail is user-driven now (tap a strip card) — it only marks the top card.
@@ -206,6 +233,8 @@ export function useInterview() {
       setHistoryChecklist(null)
       setAnsweredHistory({})
       setSuggestions(null)
+      setInvestigations(null)
+      setInvestigationsAnsweredCount(null)
       setSessionId(null)
       setOpenArms([])
       setLeaderName(null)
@@ -420,6 +449,27 @@ export function useInterview() {
     [sessionId, triage],
   )
 
+  // Request on-demand workup suggestions for the session as it stands. This function does
+  // ONE thing: call /api/investigations and store the result. NO SSE staging, NO draft
+  // clearing, NO re-score side effects (it deliberately does not touch `status`, so it
+  // never sets `busy` — answering stays available while a snapshot loads). Its own
+  // in-flight state rides the shared `submittingArm` (INVESTIGATION_ID), like every other
+  // control. Calling it again replaces the batch with a fresh one (and resets the staleness
+  // baseline via the new `generated_at_answer_count`).
+  const requestInvestigations = useCallback(async (): Promise<void> => {
+    if (!sessionId) return
+    setSubmittingArm(INVESTIGATION_ID)
+    try {
+      const batch = await suggestInvestigationsRequest(sessionId)
+      setInvestigations(batch)
+      setInvestigationsAnsweredCount(batch.generated_at_answer_count)
+    } catch (e) {
+      setStatus({ kind: "error", detail: (e as Error).message })
+    } finally {
+      setSubmittingArm(null)
+    }
+  }, [sessionId])
+
   // Lazily generate questions for ONE arm the top-N fan-out skipped, when the user
   // expands it. Mirrors the backend's idempotent /api/arm/expand; the guards just avoid
   // pointless requests (all are also enforced server-side).
@@ -484,6 +534,9 @@ export function useInterview() {
     historyChecklist,
     answeredHistory,
     suggestions,
+    investigations,
+    investigationsAnsweredCount,
+    totalAnsweredCount,
     sessionId,
     status,
     openArms,
@@ -503,6 +556,7 @@ export function useInterview() {
     answerBatch,
     submitAllDrafts,
     addCustomArms,
+    requestInvestigations,
     expandArm,
   }
 }

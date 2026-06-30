@@ -1,13 +1,21 @@
 /**
  * App — wires the interview together. The ComplaintBar morphs hero → docked; once
- * started, the page is a three-zone differential workspace (single column, stacked):
+ * started, the page is a differential workspace. The numbered zones below stack in a
+ * single LEFT column; a right-side InvestigationPane (zone 7) appears beside them only
+ * after the first "Suggest workup" click, turning the layout two-column at lg+.
  *
- *   1. ComplaintBar (hero ↔ docked) — also hosts the page-wide "Re-score" control
+ *   1. ComplaintBar (hero ↔ docked) — also hosts the page-wide "Re-score" AND the
+ *      on-demand "Suggest workup" control
  *   2. DifferentialGrid — orientation: current scores + red flags, visible immediately
- *   3. HistoryCard — orientation: history status (collapsed-by-default pinned entry point)
- *   4. SuggestionPool — action: what to ask next ("Expand full card" jumps to arm/history)
- *   5. OpenArmsLane — up to 3 full arm cards the clinician is actively working
- *   6. AnsweredLog — the chronological record (evolved Trace Viewer)
+ *   3. RescoreSummary — orientation: what just changed and why, after the latest
+ *      re-score only (renders nothing until the first re-score has happened)
+ *   4. HistoryCard — orientation: history status (collapsed-by-default pinned entry point)
+ *   5. SuggestionPool — action: what to ask next ("Expand full card" jumps to arm/history)
+ *   6. OpenArmsLane — up to 3 full arm cards the clinician is actively working
+ *   7. AnsweredLog — the chronological record, now pure Q&A (scores moved to
+ *      RescoreSummary above, kept out of the per-question transcript)
+ *   8. InvestigationPane (right column, on-demand) — tests/imaging to consider, a
+ *      read-only snapshot the clinician explicitly requests; not in the re-score loop.
  *
  * Orientation surfaces (2–3) sit ABOVE the action surface (4): the clinician sees the
  * current differential + history status before being prompted to act.
@@ -23,13 +31,16 @@ import { AnsweredLog } from "@/components/AnsweredLog"
 import { ComplaintBar } from "@/components/ComplaintBar"
 import { DifferentialGrid } from "@/components/DifferentialGrid"
 import { HistoryCard } from "@/components/HistoryCard"
+import { InvestigationPane } from "@/components/InvestigationPane"
 import { OpenArmsLane } from "@/components/OpenArmsLane"
+import { RescoreSummary } from "@/components/RescoreSummary"
 import { SuggestionPool } from "@/components/SuggestionPool"
 import { Skeleton } from "@/components/ui/skeleton"
 import {
   CUSTOM_ARM_ID,
   GLOBAL_RESCORE_ID,
   HISTORY_CARD_ID,
+  INVESTIGATION_ID,
   SUGGESTION_CARD_ID,
   useInterview,
 } from "@/hooks/useInterview"
@@ -113,15 +124,21 @@ export default function App() {
         pendingDraftCount={iv.pendingDraftCount}
         rescoreSubmitting={iv.submittingArm === GLOBAL_RESCORE_ID}
         onRescoreAll={iv.submitAllDrafts}
+        investigationsLoading={iv.submittingArm === INVESTIGATION_ID}
+        onSuggestInvestigations={iv.requestInvestigations}
       />
 
       <main
-        className="mx-auto max-w-5xl space-y-6 px-4 pb-24 transition-[padding] duration-500 ease-out"
+        className="mx-auto max-w-5xl px-4 pb-24 transition-[padding] duration-500 ease-out"
         style={{ paddingTop: iv.started ? barHeight + 24 : 0 }}
       >
         {iv.started && (
-          <>
-            {/* 1. Orientation — the differential (current scores + red flags), shown
+          // Two-column at lg+ ONLY once the workup pane exists; before that, the lone
+          // flex-1 left column behaves exactly like the previous single column (no empty
+          // space reserved for the pane). items-start lets the pane stick independently.
+          <div className="flex flex-col gap-6 lg:flex-row lg:items-start">
+            <div className="min-w-0 flex-1 space-y-6">
+            {/* 2. Orientation — the differential (current scores + red flags), shown
                 immediately so the clinician is oriented before being prompted to act. */}
             {iv.arms.length === 0 ? (
               <GridSkeleton />
@@ -140,7 +157,14 @@ export default function App() {
               />
             )}
 
-            {/* 2. Orientation — General History status (collapsed-by-default pinned entry
+            {/* 3. Orientation — what the latest re-score moved and why. Renders nothing
+                until the first re-score has happened. */}
+            <RescoreSummary
+              recentTransitions={iv.recentTransitions}
+              arms={iv.arms}
+            />
+
+            {/* 4. Orientation — General History status (collapsed-by-default pinned entry
                 point). Wrapped so openHistory can scroll to it. */}
             {iv.historyChecklist && (
               <div ref={historyRef}>
@@ -160,7 +184,7 @@ export default function App() {
               </div>
             )}
 
-            {/* 3. Action — the ranked "what to ask next" surface. */}
+            {/* 5. Action — the ranked "what to ask next" surface. */}
             <SuggestionPool
               suggestions={iv.suggestions}
               busy={busy}
@@ -175,7 +199,7 @@ export default function App() {
               clinicianArmNames={clinicianArmNames}
             />
 
-            {/* 4. Open Cards Lane — the arms being actively worked (renders nothing when
+            {/* 6. Open Cards Lane — the arms being actively worked (renders nothing when
                 empty). */}
             <OpenArmsLane
               openArms={iv.openArms}
@@ -196,9 +220,25 @@ export default function App() {
               pulse={pulse}
             />
 
-            {/* 5. Answered log (full width, the evolved Trace Viewer). */}
+            {/* 7. Answered log — pure Q&A transcript (scores moved to RescoreSummary). */}
             <AnsweredLog entries={iv.answeredLog} />
-          </>
+            </div>
+
+            {/* 8. On-demand workup pane (right column). Rendered only after the first
+                "Suggest workup" request, so no empty column is reserved beforehand. */}
+            {iv.investigations !== null && (
+              <aside className="w-full lg:w-80 lg:shrink-0">
+                <InvestigationPane
+                  batch={iv.investigations}
+                  answeredCount={iv.investigationsAnsweredCount}
+                  currentAnsweredCount={iv.totalAnsweredCount}
+                  loading={iv.submittingArm === INVESTIGATION_ID}
+                  onRefresh={iv.requestInvestigations}
+                  stickyTop={barHeight + 24}
+                />
+              </aside>
+            )}
+          </div>
         )}
       </main>
     </div>

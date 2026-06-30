@@ -44,6 +44,19 @@ SUGGESTION_MODEL = "anthropic/claude-haiku-4.5"
 # the hard truncation cap in the merge step.
 SUGGESTION_POOL_SIZE = 4
 
+# Routing for the Investigation Suggestion Agent (backend/app/agents/investigation_agent.py).
+# Unlike SUGGESTION_MODEL (called on every re-score), this agent is CLINICIAN-TRIGGERED
+# on demand — the clinician explicitly asks "what would you order right now," as many
+# times as they like. Still a selection/reasoning task over already-known case state, not
+# a fresh diagnostic judgment (the scoring already happened in Prioritization) — so it
+# routes at the same cheap/fast tier as SUGGESTION_MODEL, not PRIORITIZATION_MODEL's tier.
+INVESTIGATION_MODEL = "anthropic/claude-haiku-4.5"
+
+# How many top-scoring ACTIVE arms get a Specialized suggestion. Code-selected (NOT
+# left to the model) for the same reason _qualifying_arms's TOP_N_AUTO_GENERATE cutoff
+# is code-selected: deterministic membership, no clinical judgment needed to compute it.
+TOP_N_INVESTIGATION_ARMS = 5
+
 # Routing for the Framework Agent (backend/app/agents/framework_agent.py), which
 # runs BEFORE triage to resolve a diagnostic-arm framework for the chief complaint.
 # Two very different call profiles, so two different tiers:

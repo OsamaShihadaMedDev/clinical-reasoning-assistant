@@ -135,3 +135,25 @@ export interface HistoryChecklist {
 export interface ArmExpandResponse {
   arm: DiagnosticArm
 }
+
+/** One on-demand workup suggestion. Mirrors `InvestigationSuggestion`
+ *  (backend/app/models/investigation.py). `arm_name` is null for routine items
+ *  (baseline tests for the complaint) and a real top-arm name for specialized ones —
+ *  enforced in backend code, not trusted from the model. */
+export interface InvestigationSuggestion {
+  name: string
+  /** ONE short clinical line (like SuggestedQuestion.justification). */
+  reasoning: string
+  arm_name: string | null
+}
+
+/** Response body of `POST /api/investigations` (see `InvestigationBatch` in
+ *  investigation.py): the two workup tiers plus the answered-question count at
+ *  generation time. The pane is on-demand and does NOT auto-refresh, so
+ *  `generated_at_answer_count` drives the staleness marker when more questions are
+ *  answered after a snapshot. */
+export interface InvestigationBatch {
+  routine: InvestigationSuggestion[]
+  specialized: InvestigationSuggestion[]
+  generated_at_answer_count: number
+}
