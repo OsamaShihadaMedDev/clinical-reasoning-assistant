@@ -13,13 +13,17 @@ no multi-step progressive reveal to stream — it returns one result in one shot
 """
 
 import json
+import os
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app.agents.framework_agent import resolve_framework
@@ -32,6 +36,7 @@ from app.core.orchestration import (
     populate_questions,
     populate_questions_streaming,
 )
+from app.core.rate_limit import enforce_rate_limit
 from app.core.rescore import (
     add_custom_arms,
     apply_batch_and_rescore,
@@ -54,6 +59,26 @@ from app.models import (
 )
 
 app = FastAPI(title="Clinical Reasoning Assistant")
+
+# CORS — defense-in-depth, NOT load-bearing for the primary deploy. Under the single-
+# container deployment the frontend and API share an origin, so same-origin requests
+# bypass CORS entirely. This is a narrow, opt-in allow-list (empty by default = no
+# cross-origin access) so that a future second origin (e.g. a staging frontend) is a
+# deliberate env-var change, ALLOWED_ORIGINS, rather than a silent code edit. Registered
+# here, before the catch-all static mount at the bottom of the file (middleware/mount
+# order matters in Starlette).
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
+)
 
 _STATIC_DIR = Path(__file__).parent / "static"
 
@@ -93,6 +118,12 @@ class _Session:
     suggestions: SuggestionBatch = field(
         default_factory=lambda: SuggestionBatch(suggestions=[])
     )
+    # Wall-clock time of this session's most recent access (read OR write), used for idle
+    # TTL eviction (see SESSION_TTL_SECONDS / _get_session_or_404). Defaults to creation
+    # time; every route that touches an existing session bumps it, which is what makes the
+    # timeout IDLE rather than fixed-from-creation — an actively-used interview never
+    # expires mid-flight no matter how long it runs.
+    last_accessed: float = field(default_factory=time.time)
 
 
 # In-memory session store. CLAUDE.md Section 7: session state is intentionally the
@@ -103,6 +134,42 @@ class _Session:
 # demo, and the documented upgrade path (Redis) plugs in here without touching the
 # agents.
 _SESSIONS: dict[str, _Session] = {}
+
+
+SESSION_TTL_SECONDS = 2 * 60 * 60  # 2 hours idle. Long enough that a visitor who steps
+# away mid-interview can come back without losing state; short enough that abandoned
+# sessions (the majority of demo traffic — most visitors won't finish a full interview)
+# don't accumulate in this single process's memory indefinitely. Eviction is LAZY (on the
+# next access to a key, in _get_session_or_404), NOT a background sweep: an untouched
+# session can linger up to this long past its last use before the next lookup drops it,
+# an acceptable bound at a portfolio demo's traffic scale that avoids asyncio background-
+# task lifecycle complexity. Like _SESSIONS itself this is in-memory + single-process; if
+# this ever runs behind multiple replicas it moves to a shared store (Redis) — flagged.
+
+
+def _get_session_or_404(session_id: str) -> _Session:
+    """Fetch a live session by id, or raise a clean 404 — centralizing BOTH failure modes:
+    a never-existed id AND an idle-expired one (last access older than SESSION_TTL_SECONDS,
+    which is dropped here = lazy eviction). On success it bumps `last_accessed`, so repeated
+    use keeps a session alive (idle timeout, not fixed expiry). Replaces the scattered
+    `_SESSIONS.get(...) -> if None -> 404` blocks and the `_SESSIONS[id]` 'guaranteed
+    present' direct indexing, so the missing-session AND TTL logic live in exactly one place.
+    """
+    session = _SESSIONS.get(session_id)
+    if session is None or (time.time() - session.last_accessed) > SESSION_TTL_SECONDS:
+        # Drop the expired entry so its memory is reclaimed on this very access.
+        _SESSIONS.pop(session_id, None)
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No active session '{session_id}' (it may have expired after "
+                f"{SESSION_TTL_SECONDS // 3600}h of inactivity). Start a new interview "
+                f"via POST /api/triage first (sessions are in-memory and reset when the "
+                f"server restarts)."
+            ),
+        )
+    session.last_accessed = time.time()
+    return session
 
 
 class TriageRequest(BaseModel):
@@ -197,7 +264,7 @@ def demo_page() -> FileResponse:
 
 
 @app.post("/api/triage", response_model=TriageResponse)
-async def start_triage(request: TriageRequest) -> TriageResponse:
+async def start_triage(request: Request, body: TriageRequest) -> TriageResponse:
     """Start an interview: resolve the general-history checklist (by patient
     population), then the complaint's framework, score the arms, generate questions for
     active arms, and stash everything in the session store so it can be re-scored later.
@@ -206,13 +273,14 @@ async def start_triage(request: TriageRequest) -> TriageResponse:
     history checklist), THEN Framework Agent (load/generate the complaint framework),
     THEN triage + question generation. The history checklist is returned as its own
     response field and is independent of the complaint-specific arms."""
-    history = await resolve_history_checklist(request.patient_context)
-    framework = await resolve_framework(request.chief_complaint)
+    enforce_rate_limit(request)
+    history = await resolve_history_checklist(body.patient_context)
+    framework = await resolve_framework(body.chief_complaint)
     triage = await run_triage(
-        framework, request.chief_complaint, request.patient_context
+        framework, body.chief_complaint, body.patient_context
     )
     triage = await populate_questions(
-        triage, request.chief_complaint, request.patient_context
+        triage, body.chief_complaint, body.patient_context
     )
 
     # Rank the initial suggestion pool so it's populated immediately at interview start,
@@ -224,7 +292,7 @@ async def start_triage(request: TriageRequest) -> TriageResponse:
     session_id = uuid4().hex
     _SESSIONS[session_id] = _Session(
         triage=triage,
-        patient_context=request.patient_context,
+        patient_context=body.patient_context,
         framework=framework,
         history_checklist=history,
         suggestions=suggestions,
@@ -324,11 +392,12 @@ async def _triage_event_stream(
 
 @app.get("/api/triage/stream")
 async def stream_triage(
-    chief_complaint: str, patient_context: str = ""
+    request: Request, chief_complaint: str, patient_context: str = ""
 ) -> StreamingResponse:
     """Streaming counterpart to POST /api/triage. GET with query params because the
     browser's EventSource can only issue a GET with no body. Same work as the one-shot
     route, but delivered progressively over SSE."""
+    enforce_rate_limit(request)
     return StreamingResponse(
         _triage_event_stream(chief_complaint, patient_context),
         media_type="text/event-stream",
@@ -346,16 +415,7 @@ async def _apply_answers(
     batch route passes the whole card. Keeping ONE implementation here (rather than two
     parallel route bodies) is what makes the singular route a true thin wrapper and not
     a second code path that can drift."""
-    session = _SESSIONS.get(session_id)
-    if session is None:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"No active session '{session_id}'. Start a new interview "
-                f"via POST /api/triage first (sessions are in-memory and reset when "
-                f"the server restarts)."
-            ),
-        )
+    session = _get_session_or_404(session_id)
 
     # process_answers raises ValueError if any question id isn't found (in the arms for
     # an arm answer, or in the checklist for a history answer). Surface that as a clean
@@ -409,7 +469,10 @@ async def _answer_event_stream(
     triage stream. It drives the SAME rescore steps `process_answers` composes, just
     with stage events between them.
     """
-    session = _SESSIONS[session_id]  # guaranteed present: the route validated it.
+    # Guaranteed present and freshly touched: the route already validated via
+    # _get_session_or_404 (which 404s a missing/expired id AND bumped last_accessed)
+    # before returning this StreamingResponse, so a plain lookup is safe here.
+    session = _SESSIONS[session_id]
     try:
         yield _sse("rescoring", {"arm_count": len(_active_arms(session.triage))})
 
@@ -460,7 +523,9 @@ async def _answer_event_stream(
 
 
 @app.post("/api/answers")
-async def answer_questions_batch(request: AnswerBatchRequest) -> StreamingResponse:
+async def answer_questions_batch(
+    request: Request, body: AnswerBatchRequest
+) -> StreamingResponse:
     """Record a card's answers and re-score, STREAMING the stages over SSE.
 
     The primary answer route the React frontend uses. Unlike /api/triage/stream (a GET,
@@ -472,24 +537,16 @@ async def answer_questions_batch(request: AnswerBatchRequest) -> StreamingRespon
     error frames: 404 if the session is gone, 400 if any question_id doesn't resolve.
     Only the agent calls inside the stream can fail mid-flight (-> `error` frame). The
     terminal `done` frame carries the same shape as the old AnswerResponse body."""
-    session = _SESSIONS.get(request.session_id)
-    if session is None:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"No active session '{request.session_id}'. Start a new interview "
-                f"via POST /api/triage first (sessions are in-memory and reset when "
-                f"the server restarts)."
-            ),
-        )
-    answers = [(a.question_id, a.answer_text) for a in request.answers]
+    enforce_rate_limit(request)
+    session = _get_session_or_404(body.session_id)
+    answers = [(a.question_id, a.answer_text) for a in body.answers]
     try:
         validate_answer_ids(answers, session.triage, session.history_checklist)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return StreamingResponse(
-        _answer_event_stream(request.session_id, answers),
+        _answer_event_stream(body.session_id, answers),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -507,7 +564,7 @@ async def answer_question(request: AnswerRequest) -> AnswerResponse:
 
 
 @app.post("/api/arm/expand", response_model=ArmExpandResponse)
-async def expand_arm(request: ArmExpandRequest) -> ArmExpandResponse:
+async def expand_arm(request: Request, body: ArmExpandRequest) -> ArmExpandResponse:
     """On-demand question generation for ONE arm the top-N fan-out skipped.
 
     With top-N auto-generate (config.TOP_N_AUTO_GENERATE), only the highest-scoring
@@ -524,26 +581,16 @@ async def expand_arm(request: ArmExpandRequest) -> ArmExpandResponse:
     a double-click never regenerates or duplicates. Returns the arm's current state
     (questions included) either way.
     """
-    session = _SESSIONS.get(request.session_id)
-    if session is None:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"No active session '{request.session_id}'. Start a new interview "
-                f"via POST /api/triage first (sessions are in-memory and reset when "
-                f"the server restarts)."
-            ),
-        )
+    enforce_rate_limit(request)
+    session = _get_session_or_404(body.session_id)
 
-    arm = next(
-        (a for a in session.triage.arms if a.name == request.arm_name), None
-    )
+    arm = next((a for a in session.triage.arms if a.name == body.arm_name), None)
     if arm is None:
         raise HTTPException(
             status_code=404,
             detail=(
-                f"No arm named '{request.arm_name}' in session "
-                f"'{request.session_id}'. Use the exact arm name from the triage "
+                f"No arm named '{body.arm_name}' in session "
+                f"'{body.session_id}'. Use the exact arm name from the triage "
                 f"response."
             ),
         )
@@ -553,13 +600,13 @@ async def expand_arm(request: ArmExpandRequest) -> ArmExpandResponse:
     await ensure_arm_questions(
         arm, session.triage.chief_complaint, session.patient_context
     )
-    _SESSIONS[request.session_id] = session  # arm mutated in place; re-store for clarity
+    _SESSIONS[body.session_id] = session  # arm mutated in place; re-store for clarity
     return ArmExpandResponse(arm=arm)
 
 
 @app.post("/api/investigations", response_model=InvestigationBatch)
 async def suggest_investigations_route(
-    request: InvestigationRequest,
+    request: Request, body: InvestigationRequest
 ) -> InvestigationBatch:
     """On-demand workup suggestions (tests/imaging to consider) for the session as it
     stands right now — routine baseline plus per-arm specialized.
@@ -570,16 +617,8 @@ async def suggest_investigations_route(
     response, same shape as /api/arm/expand. The clinician can call it as many times as
     they like; each call is an independent snapshot and nothing is persisted to _SESSIONS.
     """
-    session = _SESSIONS.get(request.session_id)
-    if session is None:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"No active session '{request.session_id}'. Start a new interview "
-                f"via POST /api/triage first (sessions are in-memory and reset when "
-                f"the server restarts)."
-            ),
-        )
+    enforce_rate_limit(request)
+    session = _get_session_or_404(body.session_id)
 
     # Red-flag arm names come from the framework, the same source rescore.py's safety
     # check uses (stored once on the session, not re-resolved per call).
@@ -621,7 +660,10 @@ async def _custom_arm_event_stream(
     per-stage fail-loud-to-client discipline as the answer stream. It composes the same
     reusable rescore.py steps the answer path does.
     """
-    session = _SESSIONS[session_id]  # guaranteed present: the route validated it.
+    # Guaranteed present and freshly touched: the route already validated via
+    # _get_session_or_404 (which 404s a missing/expired id AND bumped last_accessed)
+    # before returning this StreamingResponse, so a plain lookup is safe here.
+    session = _SESSIONS[session_id]
     try:
         yield _sse("adding_arms", {"names": arm_names})
 
@@ -678,7 +720,9 @@ async def _custom_arm_event_stream(
 
 
 @app.post("/api/arm/custom")
-async def add_custom_arms_route(request: CustomArmRequest) -> StreamingResponse:
+async def add_custom_arms_route(
+    request: Request, body: CustomArmRequest
+) -> StreamingResponse:
     """Add one or more clinician-named diagnostic arms to the differential, scored TOGETHER
     against the full case-so-far, STREAMING the stages over SSE (sibling to /api/arm/expand,
     but a re-score-shaped action so it streams like /api/answers).
@@ -691,23 +735,28 @@ async def add_custom_arms_route(request: CustomArmRequest) -> StreamingResponse:
     Validation is synchronous and up front so it returns normal HTTP errors, not SSE error
     frames: 404 if the session is gone, 400 if a name is empty or duplicates an existing
     arm (case-insensitive, alias-aware — see validate_custom_arm_names)."""
-    session = _SESSIONS.get(request.session_id)
-    if session is None:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"No active session '{request.session_id}'. Start a new interview "
-                f"via POST /api/triage first (sessions are in-memory and reset when "
-                f"the server restarts)."
-            ),
-        )
+    enforce_rate_limit(request)
+    session = _get_session_or_404(body.session_id)
     try:
-        cleaned_names = validate_custom_arm_names(request.arm_names, session.triage)
+        cleaned_names = validate_custom_arm_names(body.arm_names, session.triage)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return StreamingResponse(
-        _custom_arm_event_stream(request.session_id, cleaned_names),
+        _custom_arm_event_stream(body.session_id, cleaned_names),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# Serve the built React frontend (single-container deploy): one FastAPI process serves the
+# JSON/SSE API under /api/* AND the compiled SPA at /. Mounted LAST — after every /api/*
+# route above is registered — because a StaticFiles mount at "/" is a catch-all that would
+# shadow the API routes if it were registered earlier (mount order matters in Starlette).
+# The exists() guard makes this a NO-OP in local dev (there's no frontend/dist until a
+# Docker build runs `npm run build`), where the frontend is served by Vite's own dev server
+# and vite.config.ts proxies /api/* back to this backend. Only inside the container, where
+# stage 1 produced frontend/dist, does the mount activate.
+FRONTEND_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+if FRONTEND_DIST.exists():
+    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")

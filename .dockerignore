@@ -1,0 +1,14 @@
+# Keep the build context small AND prevent host-built artifacts from clobbering the clean
+# installs done inside the image. Critically: stage 1 runs `npm ci` and THEN `COPY frontend/`,
+# so without excluding node_modules the host's (possibly Windows-built) node_modules would
+# overwrite the freshly installed Linux one and break the build.
+**/node_modules
+**/dist
+**/__pycache__
+**/*.pyc
+**/*.pyo
+.git
+.gitignore
+.venv
+**/.env*
+.claude
