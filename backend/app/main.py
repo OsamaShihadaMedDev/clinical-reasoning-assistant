@@ -36,6 +36,7 @@ from app.core.orchestration import (
     populate_questions,
     populate_questions_streaming,
 )
+from app.core.errors import public_error_detail
 from app.core.rate_limit import enforce_rate_limit
 from app.core.rescore import (
     add_custom_arms,
@@ -346,7 +347,7 @@ async def _triage_event_stream(
         framework = await resolve_framework(chief_complaint)
         triage = await run_triage(framework, chief_complaint, patient_context)
     except Exception as exc:  # noqa: BLE001 — surface ANY failure to the client cleanly
-        yield _sse("error", {"detail": f"Triage failed: {exc}"})
+        yield _sse("error", {"detail": public_error_detail(exc)})
         return
 
     yield _sse("triage", triage.model_dump())
@@ -362,7 +363,7 @@ async def _triage_event_stream(
                 {"name": arm.name, "questions": [q.model_dump() for q in arm.questions]},
             )
     except Exception as exc:  # noqa: BLE001 — same fail-loud-to-client contract
-        yield _sse("error", {"detail": f"Question generation failed: {exc}"})
+        yield _sse("error", {"detail": public_error_detail(exc)})
         return
 
     # Stage 3: rank the initial suggestion pool over the fully-populated triage (no score
@@ -373,7 +374,7 @@ async def _triage_event_stream(
             triage, framework, history, history_answers=[], transitions=[]
         )
     except Exception as exc:  # noqa: BLE001 — same fail-loud-to-client contract
-        yield _sse("error", {"detail": f"Ranking suggestions failed: {exc}"})
+        yield _sse("error", {"detail": public_error_detail(exc)})
         return
 
     yield _sse("suggestions", suggestions.model_dump())
@@ -499,7 +500,7 @@ async def _answer_event_stream(
             transitions,
         )
     except Exception as exc:  # noqa: BLE001 — fail loud TO THE CLIENT, like the triage stream
-        yield _sse("error", {"detail": str(exc)})
+        yield _sse("error", {"detail": public_error_detail(exc)})
         return
 
     # Persist the re-scored session (history_answers was mutated in place by
@@ -596,10 +597,15 @@ async def expand_arm(request: Request, body: ArmExpandRequest) -> ArmExpandRespo
         )
 
     # No-op if already populated; otherwise generates and mutates the arm in place
-    # (so it's reflected in the stored session's TriageOutput).
-    await ensure_arm_questions(
-        arm, session.triage.chief_complaint, session.patient_context
-    )
+    # (so it's reflected in the stored session's TriageOutput). A model-call failure
+    # becomes a friendly 502 (translated by public_error_detail) rather than leaking the
+    # raw upstream exception into FastAPI's default 500 body.
+    try:
+        await ensure_arm_questions(
+            arm, session.triage.chief_complaint, session.patient_context
+        )
+    except Exception as exc:  # noqa: BLE001 — translate to a friendly client message
+        raise HTTPException(status_code=502, detail=public_error_detail(exc)) from exc
     _SESSIONS[body.session_id] = session  # arm mutated in place; re-store for clarity
     return ArmExpandResponse(arm=arm)
 
@@ -630,13 +636,18 @@ async def suggest_investigations_route(
         1 for arm in session.triage.arms for q in arm.questions if q.answered
     ) + len(session.history_answers)
 
-    return await suggest_investigations(
-        triage_output=session.triage,
-        patient_context=session.patient_context,
-        history_answers=session.history_answers,
-        red_flag_arm_names=red_flag_arm_names,
-        total_answered_count=total_answered_count,
-    )
+    # A model-call failure becomes a friendly 502 (translated by public_error_detail)
+    # rather than leaking the raw upstream exception into FastAPI's default 500 body.
+    try:
+        return await suggest_investigations(
+            triage_output=session.triage,
+            patient_context=session.patient_context,
+            history_answers=session.history_answers,
+            red_flag_arm_names=red_flag_arm_names,
+            total_answered_count=total_answered_count,
+        )
+    except Exception as exc:  # noqa: BLE001 — translate to a friendly client message
+        raise HTTPException(status_code=502, detail=public_error_detail(exc)) from exc
 
 
 async def _custom_arm_event_stream(
@@ -698,7 +709,7 @@ async def _custom_arm_event_stream(
             transitions,
         )
     except Exception as exc:  # noqa: BLE001 — fail loud TO THE CLIENT, like the other streams
-        yield _sse("error", {"detail": str(exc)})
+        yield _sse("error", {"detail": public_error_detail(exc)})
         return
 
     _SESSIONS[session_id] = _Session(

@@ -70,6 +70,10 @@ interface ComplaintBarProps {
   /** Reports the bar's measured height so the page can reserve top padding and
    *  never hide arm cards behind the fixed bar (whatever it wraps to). */
   onHeightChange?: (height: number) => void
+  /** Pixels to push the bar down from the top when docked, so it clears the page-wide
+   *  disclaimer banner (App.tsx) that sits above it. Only applied in the docked (fixed
+   *  top) state; the hero already clears the banner via its 28vh offset / mobile padding. */
+  topOffset?: number
   /** Global "Re-score" control (anchored here, beside the status chip): pending draft
    *  count across the page, its in-flight flag, and the submit-all handler. */
   pendingDraftCount: number
@@ -88,6 +92,7 @@ export function ComplaintBar({
   status,
   onStart,
   onHeightChange,
+  topOffset = 0,
   pendingDraftCount,
   rescoreSubmitting,
   onRescoreAll,
@@ -117,6 +122,10 @@ export function ComplaintBar({
 
   return (
     <div
+      // Docked only: push the fixed bar below the disclaimer banner (App.tsx). Inline
+      // `top` overrides the `top-0` class; the hero states need no offset (28vh / mobile
+      // padding already clear the banner), so leave their positioning untouched.
+      style={docked ? { top: topOffset } : undefined}
       className={cn(
         "z-30 origin-top will-change-transform transition-transform duration-500 ease-out",
         docked
@@ -232,9 +241,13 @@ export function ComplaintBar({
               </Button>
             </form>
 
+            {/* Rendered ONCE here, outside the docked conditional, so a hero-state submit
+                failure is visible too (StreamingStatus returns null for idle/in the normal
+                hero idle case, so this stays quiet until something actually fails). */}
+            <StreamingStatus status={status} className="mt-2" />
+
             {docked && (
-              <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
-                <StreamingStatus status={status} />
+              <div className="mt-2 flex flex-wrap items-center justify-end gap-2">
                 <div className="flex flex-wrap items-center gap-2">
                   {/* On-demand workup snapshot. Distinct outline styling so it doesn't read
                       as a second Re-score; disabled while any stream is busy (don't snapshot

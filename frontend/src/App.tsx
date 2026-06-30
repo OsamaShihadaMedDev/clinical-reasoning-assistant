@@ -25,7 +25,7 @@
  * All data comes from the two SSE streams (triage + answer) via useInterview — no mocks.
  */
 
-import { useRef, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 
 import { AnsweredLog } from "@/components/AnsweredLog"
 import { ComplaintBar } from "@/components/ComplaintBar"
@@ -70,6 +70,21 @@ function GridSkeleton() {
 export default function App() {
   const iv = useInterview()
   const [barHeight, setBarHeight] = useState(0)
+  // Measured height of the fixed disclaimer banner, so the docked ComplaintBar (via its
+  // topOffset prop) and the main content below both clear it. Measured rather than a fixed
+  // constant because the disclaimer text wraps to 2+ lines on narrow screens — a constant
+  // would under-reserve on mobile and let the banner overlap the docked bar.
+  const [bannerHeight, setBannerHeight] = useState(0)
+  const bannerRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const node = bannerRef.current
+    if (!node) return
+    const report = () => setBannerHeight(node.getBoundingClientRect().height)
+    report()
+    const observer = new ResizeObserver(report)
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [])
   // Pulse target for the lane: bumping `signal` for an arm makes its lane card scroll
   // into view + flash. Used when "Expand full card" targets an arm (so an already-open
   // arm doesn't feel like a silent no-op, and a newly-opened one scrolls into view).
@@ -115,12 +130,23 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-background">
+      {/* Standing, non-dismissible disclaimer — visible in BOTH hero and docked states for
+          the whole session. z-40 keeps it above ComplaintBar (z-30); everything below is
+          offset by its measured height so nothing hides behind it. */}
+      <div
+        ref={bannerRef}
+        className="fixed inset-x-0 top-0 z-40 border-b border-border bg-muted/80 px-4 py-1.5 text-center text-xs text-muted-foreground backdrop-blur-sm"
+      >
+        Demonstration tool using simulated patient cases — not for real patient care or
+        clinical decision-making.
+      </div>
       <ComplaintBar
         docked={iv.started}
         busy={busy}
         status={iv.status}
         onStart={iv.start}
         onHeightChange={setBarHeight}
+        topOffset={bannerHeight}
         pendingDraftCount={iv.pendingDraftCount}
         rescoreSubmitting={iv.submittingArm === GLOBAL_RESCORE_ID}
         onRescoreAll={iv.submitAllDrafts}
@@ -130,7 +156,7 @@ export default function App() {
 
       <main
         className="mx-auto max-w-5xl px-4 pb-24 transition-[padding] duration-500 ease-out"
-        style={{ paddingTop: iv.started ? barHeight + 24 : 0 }}
+        style={{ paddingTop: iv.started ? bannerHeight + barHeight + 24 : 0 }}
       >
         {iv.started && (
           // Two-column at lg+ ONLY once the workup pane exists; before that, the lone
@@ -234,7 +260,7 @@ export default function App() {
                   currentAnsweredCount={iv.totalAnsweredCount}
                   loading={iv.submittingArm === INVESTIGATION_ID}
                   onRefresh={iv.requestInvestigations}
-                  stickyTop={barHeight + 24}
+                  stickyTop={bannerHeight + barHeight + 24}
                 />
               </aside>
             )}
