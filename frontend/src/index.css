@@ -166,3 +166,23 @@
     @apply font-heading;
     }
 }
+
+/* Brand logo mark (Logo.tsx) — the two "branch" nodes of the share/network glyph breathe
+   in a slow, staggered pulse so the mark reads as live (a complaint fanning out into
+   diagnostic arms) without any glow. Scoped to prefers-reduced-motion: no-preference, so
+   the mark falls back to a fully static logo (nodes at natural opacity/scale) for users
+   who ask for reduced motion. */
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes cra-logo-node {
+    0%, 100% { opacity: 0.6; transform: scale(0.86); }
+    50%      { opacity: 1;   transform: scale(1); }
+  }
+  .cra-logo-node {
+    transform-box: fill-box;
+    transform-origin: center;
+    animation: cra-logo-node 2.6s ease-in-out infinite;
+  }
+  .cra-logo-node--delayed {
+    animation-delay: 1.3s;
+  }
+}

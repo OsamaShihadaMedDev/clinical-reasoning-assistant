@@ -18,13 +18,14 @@
  */
 
 import { useEffect, useRef, useState } from "react"
-import { BrainCircuit, FlaskConical, LoaderCircle, Stethoscope } from "lucide-react"
+import { FlaskConical, LoaderCircle, Stethoscope } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { GlobalRescoreButton } from "@/components/GlobalRescoreButton"
+import { Logo } from "@/components/Logo"
 import { ScoreGauge } from "@/components/ScoreGauge"
 import { StreamingStatus } from "@/components/StreamingStatus"
 import { cn } from "@/lib/utils"
@@ -155,8 +156,8 @@ export function ComplaintBar({
         <div className={cn(docked ? "w-full" : "w-full max-w-md lg:flex-1")}>
           {!docked && (
             <>
-              <div className="mb-3 inline-flex items-center gap-2 rounded-full border border-border bg-card px-3 py-1 text-xs font-medium text-brand">
-                <BrainCircuit className="size-3.5" />
+              <div className="mb-3 inline-flex items-center gap-2 rounded-full border border-border bg-card py-1 pr-3 pl-1.5 text-xs font-medium text-brand">
+                <Logo animated className="size-5" />
                 Clinical Reasoning Assistant
               </div>
               <h1 className="font-heading text-3xl font-semibold tracking-tight text-foreground sm:text-4xl">
@@ -184,9 +185,7 @@ export function ComplaintBar({
                 docked ? "flex-row flex-wrap items-end" : "flex-col",
               )}
             >
-              {docked && (
-                <Stethoscope className="mb-1.5 hidden size-5 shrink-0 text-brand sm:block" />
-              )}
+              {docked && <Logo animated className="mb-0.5 hidden size-7 sm:inline-flex" />}
 
               <div className={cn("flex flex-col gap-1", docked ? "min-w-[180px] flex-1" : "")}>
                 {!docked && (
